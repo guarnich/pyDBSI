@@ -78,7 +78,7 @@ python examples/run_dbsi.py \
 ### Example
 
 ```bash
-python examples/run_dbsi_cli.py \
+python examples/run_dbsi.py \
     --nii  "subject/dwi/dwi_preproc.nii.gz" \
     --bval "subject/dwi/dwi.bval" \
     --bvec "subject/dwi/dwi.bvec" \

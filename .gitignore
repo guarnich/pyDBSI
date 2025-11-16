@@ -207,16 +207,3 @@ marimo/_lsp/
 __marimo__/
 
 
-# Python
-__pycache__/
-*.pyc
-build/
-dist/
-*.egg-info/
-
-# Jupyter
-.ipynb_checkpoints
-
-# OS
-.DS_Store
-
