@@ -1,42 +1,44 @@
+
 # pyDBSI
+
 Python toolbox for fitting the Diffusion Basis Spectrum Imaging (DBSI) model to diffusion-weighted MRI data.
 
-# Esempi di Fitting DBSI
+# DBSI Fitting Examples
 
-Questa cartella contiene due modi principali per eseguire il fitting del modello DBSI utilizzando il `dbsi_toolbox`.
+This folder contains two primary methods for running the DBSI model fitting using the `dbsi_toolbox`.
 
-## 1. Installazione (Necessaria)
+## 1\. Installation (Required)
 
-Prima di eseguire qualsiasi esempio, devi installare il toolbox in "modalità sviluppo". Questo collega il pacchetto al tuo ambiente Python, permettendoti di importarlo.
+Before running any examples, you must install the toolbox in "editable mode." This links the package to your Python environment, allowing you to import it.
 
-Dalla **cartella principale** (la directory che contiene `setup.py`), esegui:
+From the **root directory** (the folder containing `setup.py`), run:
 
 ```bash
 pip install -e .
 ```
 
-(Il `.` si riferisce alla cartella corrente).
+(The `.` refers to the current directory).
 
----
+-----
 
-## Script da Linea di Comando (Stile Bash/CLI)
+## Command Line Interface (Bash/CLI Style)
 
-Questo è il metodo più robusto per l'integrazione in pipeline automatiche (es. script Bash, SLURM).
+This is the most robust method for integrating into automated pipelines (e..g., Bash scripts, SLURM).
 
 **Script:** `run_dbsi_cli.py`
 
-### Come Eseguirlo
+### How to Run
 
-Passa i percorsi dei file come argomenti direttamente nel terminale.
+Pass the file paths as arguments directly in your terminal.
 
-#### Template del Comando
+#### Command Template
 
 ```bash
 python examples/run_dbsi_cli.py \
-    --nii  "<percorso_al_tuo_file.nii.gz>" \
-    --bval "<percorso_al_tuo_file.bval>" \
-    --bvec "<percorso_al_tuo_file.bvec>" \
-    --mask "<percorso_alla_tua_maschera.nii.gz>" \
-    --out  "<directory_per_i_risultati>" \
-    --prefix "mio_prefisso_output"
+    --nii  "<path_to_your_file.nii.gz>" \
+    --bval "<path_to_your_file.bval>" \
+    --bvec "<path_to_your_file.bvec>" \
+    --mask "<path_to_your_mask.nii.gz>" \
+    --out  "<directory_for_results>" \
+    --prefix "my_output_prefix"
 ```
