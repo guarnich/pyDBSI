@@ -44,7 +44,7 @@ def main():
     args = parser.parse_args()
 
     print("="*70)
-    print("DBSI Toolbox - 'CLI Style' (Bash) Execution")
+    print("DBSI Toolbox - ' Bash Execution")
     print("="*70)
     print(f"Input NIfTI:  {args.nii}")
     print(f"Input bval:   {args.bval}")
