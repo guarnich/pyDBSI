@@ -9,11 +9,7 @@ from .common import DBSIParams
 
 class DBSI_TwoStep(BaseDBSI):
     """
-    Orchestrator class that implements the DBSI Two-Step approach:
-    1. Run Linear DBSI (NNLS) to find active fiber compartments and spectrum.
-    2. Use Linear results as initial guess for Non-Linear DBSI (Least Squares).
-    
-    This provides the robustness of Basis Spectrum with the precision of Non-Linear fitting.
+    Orchestrator class that implements the DBSI Two-Step approach.
     """
     
     def __init__(self, 
@@ -36,7 +32,7 @@ class DBSI_TwoStep(BaseDBSI):
             filter_threshold=filter_threshold
         )
         
-        self.nonlinear_model = DBSI_NonLinear() # Doesn't need config params at init
+        self.nonlinear_model = DBSI_NonLinear() 
         
     def fit_volume(self, volume, bvals, bvecs, **kwargs):
         """
@@ -53,7 +49,12 @@ class DBSI_TwoStep(BaseDBSI):
             
         # 2. IMPORTANT: Initialize the Linear Model's Matrix
         print("Step 1/2: Pre-calculating Linear Design Matrix...", end="")
-        self.linear_model._build_design_matrix(flat_bvals, current_bvecs)
+        
+        # --- CORREZIONE QUI SOTTO ---
+        # Prima chiamavamo solo la funzione senza assegnare il risultato.
+        # Ora assegniamo il risultato a self.linear_model.design_matrix
+        self.linear_model.design_matrix = self.linear_model._build_design_matrix(flat_bvals, current_bvecs)
+        
         # Share the current bvecs with both models
         self.linear_model.current_bvecs = current_bvecs
         self.nonlinear_model.current_bvecs = current_bvecs
@@ -68,7 +69,6 @@ class DBSI_TwoStep(BaseDBSI):
         The core Two-Step logic for a single voxel.
         """
         # --- STEP 1: Linear Fit (Basis Spectrum) ---
-        # This is fast and robust against local minima
         linear_result = self.linear_model.fit_voxel(signal, bvals)
         
         # If Linear fit failed completely (e.g. bad data), skip NonLinear
@@ -76,8 +76,7 @@ class DBSI_TwoStep(BaseDBSI):
             return linear_result
             
         # --- STEP 2: Non-Linear Fit (Refinement) ---
-        # Use linear result as initial guess (p0) to refine diffusivities and angles
-        # This extracts specific Axial/Radial diffusivities instead of fixed basis values
+        # Use linear result as initial guess (p0)
         final_result = self.nonlinear_model.fit_voxel(signal, bvals, initial_guess=linear_result)
         
         return final_result
