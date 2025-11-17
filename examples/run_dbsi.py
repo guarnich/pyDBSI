@@ -9,7 +9,7 @@ import warnings
 # Import from the installed toolbox
 try:
     from dbsi_toolbox.utils import load_dwi_data_dipy, save_parameter_maps
-    from dbsi_toolbox.model import DBSIModel
+    from dbsi_toolbox import DBSIModel
 except ImportError:
     print("ERROR: Could not import 'dbsi_toolbox'.")
     print("Please ensure the package is installed by running 'pip install -e .' in the root directory.")
