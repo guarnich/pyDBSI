@@ -6,10 +6,10 @@ from typing import Tuple, Optional
 from .base import BaseDBSI
 from .common import DBSIParams
 
-class DBSI_Linear(BaseDBSI):
+class DBSI_BasisSpectrum(BaseDBSI):  # <--- CAMBIATO
     """
-    DBSI implementation using Linear Basis Spectrum and NNLS.
-    Includes Tikhonov Regularization and Sparsity Filtering.
+    DBSI Basis Spectrum solver using NNLS.
+    Calculates the contribution of each basis function (anisotropic & isotropic).
     """
     def __init__(self, 
                  iso_diffusivity_range: Tuple[float, float] = (0.0, 3.0e-3),

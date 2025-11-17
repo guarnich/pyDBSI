@@ -1,7 +1,7 @@
 # dbsi_toolbox/__init__.py
 
-from .linear import DBSI_Linear
-from .nonlinear import DBSI_NonLinear
+from .spectrum_basis import DBSI_BasisSpectrum
+from .nlls_tensor_fit import DBSI_TensorFit
 from .twostep import DBSI_TwoStep  
 from .common import DBSIParams
 from .utils import load_dwi_data_dipy, save_parameter_maps

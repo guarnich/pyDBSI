@@ -6,10 +6,10 @@ from .base import BaseDBSI
 from .common import DBSIParams
 from typing import Optional
 
-class DBSI_NonLinear(BaseDBSI):
+class DBSI_TensorFit(BaseDBSI):  # <--- CAMBIATO
     """
-    DBSI implementation using Non-Linear Least Squares (NLLS).
-    Can be initialized with results from the Linear model (Two-Step Approach).
+    DBSI Tensor parameter estimation using Non-Linear Least Squares.
+    Refines diffusivities and angles starting from an initial guess.
     """
     def __init__(self):
         self.n_params = 10
