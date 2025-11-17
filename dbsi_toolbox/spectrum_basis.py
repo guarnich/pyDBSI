@@ -6,7 +6,7 @@ from typing import Tuple, Optional
 from .base import BaseDBSI
 from .common import DBSIParams
 
-class DBSI_BasisSpectrum(BaseDBSI):  # <--- CAMBIATO
+class DBSI_BasisSpectrum(BaseDBSI):  
     """
     DBSI Basis Spectrum solver using NNLS.
     Calculates the contribution of each basis function (anisotropic & isotropic).
