@@ -1,4 +1,4 @@
-# dbsi_toolbox/linear.py
+# dbsi_toolbox/spectrum_basis.py
 
 import numpy as np
 from scipy.optimize import nnls
@@ -13,7 +13,7 @@ class DBSI_BasisSpectrum(BaseDBSI):
     """
     def __init__(self, 
                  iso_diffusivity_range: Tuple[float, float] = (0.0, 3.0e-3),
-                 n_iso_bases: int = 20,
+                 n_iso_bases: int = 25,
                  axial_diff_basis: float = 1.5e-3,
                  radial_diff_basis: float = 0.3e-3,
                  reg_lambda: float = 0.01,   # New: Regularization strength

@@ -1,4 +1,4 @@
-# dbsi_toolbox/nonlinear.py
+# dbsi_toolbox/nlls_tensor_fit.py
 
 import numpy as np
 from scipy.optimize import least_squares
