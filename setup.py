@@ -2,11 +2,16 @@ from setuptools import setup, find_packages
 
 setup(
     name="dbsi_toolbox",
-    version="0.2.0",  # Aggiornata per includere DL e Calibrazione
+    version="0.2.0", 
     author="Francesco Guarnaccia",
     description="A comprehensive toolbox for Diffusion Basis Spectrum Imaging (Standard & Deep Learning)",
     url="https://github.com/guarnich/pyDBSI",
     packages=find_packages(),
+    entry_points={
+        'console_scripts': [
+            'dbsi-fit=scripts.dbsi_cli:main',
+        ],
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
