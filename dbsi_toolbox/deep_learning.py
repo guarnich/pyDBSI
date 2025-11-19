@@ -87,13 +87,11 @@ class DBSI_RegularizedMLP(nn.Module):
     def forward(self, x):
         raw = self.net(x)
         
-        # --- 1. Hierarchical Fractions (The Fix) ---
-        # Instead of one big Softmax, we split the decision:
+        # --- 1. Hierarchical Fractions ---
         # A) How much is Fiber? (Sigmoid -> starts at 0.5 probability)
         f_fiber_prob = self.sigmoid(raw[:, self.n_iso])
         
         # B) How is the REST distributed among isotropic bases? (Softmax)
-        # We allocate the remaining probability (1 - f_fiber) to the isotropic spectrum
         f_iso_total_prob = 1.0 - f_fiber_prob
         iso_logits = raw[:, :self.n_iso]
         iso_distribution = torch.softmax(iso_logits, dim=1)
@@ -108,13 +106,12 @@ class DBSI_RegularizedMLP(nn.Module):
         theta = self.sigmoid(raw[:, self.n_iso + 1]) * np.pi        
         phi   = (self.sigmoid(raw[:, self.n_iso + 2]) - 0.5) * 2 * np.pi
         
-        # --- 3. Diffusivities (Delta-Parametrization from previous step) ---
-        # We keep this because it works well for the means.
+        # --- 3. Diffusivities (Delta-Parametrization) ---
         d_rad_raw = self.sigmoid(raw[:, self.n_iso + 4])
         d_rad = d_rad_raw * 1.5e-3 
 
         delta_raw = self.sigmoid(raw[:, self.n_iso + 3])
-        d_delta = (delta_raw * 2.4e-3) + 0.1e-3 # Gap 0.1 to force anisotropy
+        d_delta = (delta_raw * 2.4e-3) + 0.1e-3 # Gap 0.1
         
         d_ax = d_rad + d_delta
 
@@ -127,13 +124,14 @@ class DBSI_RegularizedMLP(nn.Module):
             d_rad.unsqueeze(1)
         ], dim=1)
 
+
 class DBSI_DeepSolver:
     """
-    Self-Supervised Solver with Denoising Regularization.
+    Self-Supervised Solver with Denoising Regularization & LR Scheduler.
     """
     def __init__(self, 
                  n_iso_bases: int = 20,
-                 epochs: int = 150,      
+                 epochs: int = 300,      # Increased default epochs
                  batch_size: int = 2048, 
                  learning_rate: float = 1e-3,
                  noise_injection_level: float = 0.02):
@@ -147,13 +145,12 @@ class DBSI_DeepSolver:
     def fit_volume(self, volume: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray, mask: np.ndarray) -> Dict[str, np.ndarray]:
         
         print(f"[DeepSolver] Starting training on device: {DEVICE}")
-        print(f"[DeepSolver] Geometry: Delta-Parameterization (No Dead Gradients)")
+        print(f"[DeepSolver] Config: Epochs={self.epochs}, Scheduler=ReduceLROnPlateau")
         
         # 1. Data Preparation
         X_vol, Y_vol, Z_vol, N_meas = volume.shape
         valid_signals = volume[mask]
         
-        # Robust Normalization
         valid_signals = np.nan_to_num(valid_signals, nan=0.0, posinf=0.0, neginf=0.0)
         valid_signals = np.maximum(valid_signals, 0.0)
         
@@ -181,6 +178,12 @@ class DBSI_DeepSolver:
         ).to(DEVICE)
         
         optimizer = optim.AdamW(encoder.parameters(), lr=self.lr, weight_decay=1e-4)
+        
+        # NEW: Scheduler per ridurre il LR quando la loss si appiattisce
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=15, verbose=True, min_lr=1e-6
+        )
+        
         loss_fn = nn.L1Loss()
         
         # 3. Training Loop
@@ -208,8 +211,20 @@ class DBSI_DeepSolver:
                 
                 epoch_loss += loss.item()
             
+            avg_loss = epoch_loss / len(dataloader)
+            
+            # Step dello scheduler
+            scheduler.step(avg_loss)
+            
+            # Logging ogni 10 epoche
             if (epoch + 1) % 10 == 0:
-                print(f"  Epoch {epoch+1}: Avg Loss = {epoch_loss / len(dataloader):.6f}")
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"  Epoch {epoch+1}: Avg Loss = {avg_loss:.6f} | LR = {current_lr:.2e}")
+                
+            # Early Stopping manuale se il LR diventa troppo basso (convergenza raggiunta)
+            if optimizer.param_groups[0]['lr'] < 5e-6:
+                print(f"[DeepSolver] Convergenza raggiunta all'epoca {epoch+1}. Stop.")
+                break
         
         # 4. Inference
         print("[DeepSolver] Generating volumetric maps...")
