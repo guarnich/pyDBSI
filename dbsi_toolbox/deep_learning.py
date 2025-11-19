@@ -15,19 +15,14 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class DBSI_PhysicsDecoder(nn.Module):
     """
     Physics-Informed Decoder (Non-trainable).
-    Implements the exact DBSI equation (Wang et al., 2011).
+    Implements the exact DBSI equation.
     """
     def __init__(self, bvals: np.ndarray, bvecs: np.ndarray, n_iso_bases: int = 50):
         super().__init__()
-        
-        # Fixed buffers
         self.register_buffer('bvals', torch.tensor(bvals, dtype=torch.float32))
         self.register_buffer('bvecs', torch.tensor(bvecs, dtype=torch.float32))
-        
-        # Fixed spectral grid [0, 3.0] um^2/ms
         iso_grid = torch.linspace(0, 3.0e-3, n_iso_bases)
         self.register_buffer('iso_diffusivities', iso_grid)
-        
         self.n_iso = n_iso_bases
 
     def forward(self, params: torch.Tensor) -> torch.Tensor:
@@ -38,7 +33,6 @@ class DBSI_PhysicsDecoder(nn.Module):
         d_ax          = params[:, self.n_iso + 3]
         d_rad         = params[:, self.n_iso + 4]
 
-        # 1. Anisotropic Component
         fiber_dir = torch.stack([
             torch.sin(theta) * torch.cos(phi),
             torch.sin(theta) * torch.sin(phi),
@@ -50,7 +44,6 @@ class DBSI_PhysicsDecoder(nn.Module):
         
         signal_fiber = f_fiber.unsqueeze(1) * torch.exp(-self.bvals.unsqueeze(0) * d_app_fiber)
 
-        # 2. Isotropic Component
         basis_iso = torch.exp(-torch.ger(self.bvals, self.iso_diffusivities))
         signal_iso = torch.matmul(f_iso_weights, basis_iso.T)
 
@@ -59,15 +52,16 @@ class DBSI_PhysicsDecoder(nn.Module):
 
 class DBSI_RegularizedMLP(nn.Module):
     """
-    MLP Encoder with Hierarchical Fraction Estimation.
-    Decouples Fiber fraction prediction from Isotropic distribution to prevent
-    dilution of the fiber signal in the early training stages.
+    MLP Encoder with Hierarchical Fraction Estimation & Bias Initialization.
     """
     def __init__(self, n_input_meas: int, n_iso_bases: int = 50, dropout_rate: float = 0.1):
         super().__init__()
         self.n_iso = n_iso_bases
         self.n_output = n_iso_bases + 5 
         
+        # Output layer is defined separately to access weights
+        self.head = nn.Linear(64, self.n_output)
+
         self.net = nn.Sequential(
             nn.Linear(n_input_meas, 128),
             nn.LayerNorm(128),
@@ -79,39 +73,48 @@ class DBSI_RegularizedMLP(nn.Module):
             nn.ELU(),
             nn.Dropout(dropout_rate),
             
-            nn.Linear(64, self.n_output)
+            self.head 
         )
         
         self.sigmoid = nn.Sigmoid()
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """
+        TRUCCO PRO: Inizializzazione Bias Pro-Fibra.
+        Impostiamo il bias del neurone 'fiber_fraction' a un valore alto (es. +2.0).
+        Sigmoid(2.0) ~= 0.88.
+        Questo costringe il modello a partire assumendo che ci sia l'88% di fibra.
+        Dovrà 'lottare' per spegnerla, garantendo che i gradienti per orientamento/diffusività
+        rimangano attivi all'inizio del training.
+        """
+        # Indice del neurone fibra (corrisponde a n_iso)
+        with torch.no_grad():
+            self.head.bias[self.n_iso].fill_(2.0) 
 
     def forward(self, x):
         raw = self.net(x)
         
-        # --- 1. Hierarchical Fractions ---
-        # A) How much is Fiber? (Sigmoid -> starts at 0.5 probability)
+        # 1. Hierarchical Fractions
         f_fiber_prob = self.sigmoid(raw[:, self.n_iso])
         
-        # B) How is the REST distributed among isotropic bases? (Softmax)
         f_iso_total_prob = 1.0 - f_fiber_prob
         iso_logits = raw[:, :self.n_iso]
         iso_distribution = torch.softmax(iso_logits, dim=1)
         
-        # Combine: f_iso_i = (1 - f_fiber) * distribution_i
         f_iso = f_iso_total_prob.unsqueeze(1) * iso_distribution
-        
-        # Ensure flat fiber fraction for output concatenation
         f_fiber = f_fiber_prob
         
-        # --- 2. Angles ---
+        # 2. Angles
         theta = self.sigmoid(raw[:, self.n_iso + 1]) * np.pi        
         phi   = (self.sigmoid(raw[:, self.n_iso + 2]) - 0.5) * 2 * np.pi
         
-        # --- 3. Diffusivities (Delta-Parametrization) ---
+        # 3. Diffusivities (Delta-Parametrization)
         d_rad_raw = self.sigmoid(raw[:, self.n_iso + 4])
         d_rad = d_rad_raw * 1.5e-3 
 
         delta_raw = self.sigmoid(raw[:, self.n_iso + 3])
-        d_delta = (delta_raw * 2.4e-3) + 0.1e-3 # Gap 0.1
+        d_delta = (delta_raw * 2.4e-3) + 0.1e-3 
         
         d_ax = d_rad + d_delta
 
@@ -127,11 +130,11 @@ class DBSI_RegularizedMLP(nn.Module):
 
 class DBSI_DeepSolver:
     """
-    Self-Supervised Solver with Denoising Regularization & LR Scheduler.
+    Self-Supervised Solver with StepLR.
     """
     def __init__(self, 
                  n_iso_bases: int = 20,
-                 epochs: int = 300,      # Increased default epochs
+                 epochs: int = 500,      # Aumentato a 500 per dare tempo allo StepLR
                  batch_size: int = 2048, 
                  learning_rate: float = 1e-3,
                  noise_injection_level: float = 0.02):
@@ -145,15 +148,14 @@ class DBSI_DeepSolver:
     def fit_volume(self, volume: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray, mask: np.ndarray) -> Dict[str, np.ndarray]:
         
         print(f"[DeepSolver] Starting training on device: {DEVICE}")
-        print(f"[DeepSolver] Config: Epochs={self.epochs}, Scheduler=ReduceLROnPlateau")
+        print(f"[DeepSolver] Config: Epochs={self.epochs}, Scheduler=StepLR (Step=50, Gamma=0.5)")
+        print(f"[DeepSolver] Trick: Pro-Fiber Initialization Active")
         
-        # 1. Data Preparation
+        # Data Prep
         X_vol, Y_vol, Z_vol, N_meas = volume.shape
         valid_signals = volume[mask]
-        
         valid_signals = np.nan_to_num(valid_signals, nan=0.0, posinf=0.0, neginf=0.0)
         valid_signals = np.maximum(valid_signals, 0.0)
-        
         b0_idx = np.where(bvals < 50)[0]
         if len(b0_idx) > 0:
             s0 = np.mean(valid_signals[:, b0_idx], axis=1, keepdims=True)
@@ -164,29 +166,19 @@ class DBSI_DeepSolver:
         dataset = TensorDataset(torch.tensor(valid_signals, dtype=torch.float32))
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         
-        # 2. Model Initialization
-        encoder = DBSI_RegularizedMLP(
-            n_input_meas=N_meas, 
-            n_iso_bases=self.n_iso_bases,
-            dropout_rate=0.1
-        ).to(DEVICE)
-        
-        decoder = DBSI_PhysicsDecoder(
-            bvals, 
-            bvecs, 
-            n_iso_bases=self.n_iso_bases
-        ).to(DEVICE)
+        # Init
+        encoder = DBSI_RegularizedMLP(n_input_meas=N_meas, n_iso_bases=self.n_iso_bases).to(DEVICE)
+        decoder = DBSI_PhysicsDecoder(bvals, bvecs, n_iso_bases=self.n_iso_bases).to(DEVICE)
         
         optimizer = optim.AdamW(encoder.parameters(), lr=self.lr, weight_decay=1e-4)
         
-        # NEW: Scheduler per ridurre il LR quando la loss si appiattisce
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=15, verbose=True, min_lr=1e-6
-        )
+        # SCHEDULER STEP: Dimezza il LR ogni 50 epoche.
+        # Questo GARANTISCE che il LR scenda e il modello converga.
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
         
         loss_fn = nn.L1Loss()
         
-        # 3. Training Loop
+        # Training
         print(f"[DeepSolver] Training on {len(valid_signals)} voxels...")
         encoder.train()
         
@@ -195,7 +187,6 @@ class DBSI_DeepSolver:
             
             for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}", leave=False, file=sys.stdout):
                 clean_signal = batch[0].to(DEVICE)
-                
                 noise = torch.randn_like(clean_signal) * self.noise_level
                 noisy_input = clean_signal + noise
                 
@@ -211,22 +202,15 @@ class DBSI_DeepSolver:
                 
                 epoch_loss += loss.item()
             
-            avg_loss = epoch_loss / len(dataloader)
+            # Step Scheduler (non dipende più dalla loss, scende a prescindere)
+            scheduler.step()
             
-            # Step dello scheduler
-            scheduler.step(avg_loss)
-            
-            # Logging ogni 10 epoche
-            if (epoch + 1) % 10 == 0:
+            if (epoch + 1) % 50 == 0: # Log meno frequente
                 current_lr = optimizer.param_groups[0]['lr']
+                avg_loss = epoch_loss / len(dataloader)
                 print(f"  Epoch {epoch+1}: Avg Loss = {avg_loss:.6f} | LR = {current_lr:.2e}")
-                
-            # Early Stopping manuale se il LR diventa troppo basso (convergenza raggiunta)
-            if optimizer.param_groups[0]['lr'] < 5e-6:
-                print(f"[DeepSolver] Convergenza raggiunta all'epoca {epoch+1}. Stop.")
-                break
         
-        # 4. Inference
+        # Inference
         print("[DeepSolver] Generating volumetric maps...")
         encoder.eval()
         full_loader = DataLoader(dataset, batch_size=self.batch_size*2, shuffle=False)
@@ -240,7 +224,7 @@ class DBSI_DeepSolver:
                 
         flat_results = np.concatenate(all_preds, axis=0)
         
-        # 5. Reconstruction
+        # Reconstruction
         def to_3d(flat_arr):
             vol = np.zeros((X_vol, Y_vol, Z_vol), dtype=np.float32)
             vol[mask] = flat_arr
@@ -253,7 +237,6 @@ class DBSI_DeepSolver:
         d_ax        = flat_results[:, self.n_iso_bases+3]
         d_rad       = flat_results[:, self.n_iso_bases+4]
         
-        # Spectral Aggregation
         grid = np.linspace(0, 3.0e-3, self.n_iso_bases)
         mask_res = grid <= 0.3e-3
         mask_hin = (grid > 0.3e-3) & (grid <= 2.0e-3)
