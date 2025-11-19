@@ -20,7 +20,7 @@ class DBSI_PhysicsDecoder(nn.Module):
     def __init__(self, bvals: np.ndarray, bvecs: np.ndarray, n_iso_bases: int = 50):
         super().__init__()
         
-        # Fixed buffers for acquisition geometry
+        # Fixed buffers
         self.register_buffer('bvals', torch.tensor(bvals, dtype=torch.float32))
         self.register_buffer('bvecs', torch.tensor(bvecs, dtype=torch.float32))
         
@@ -38,7 +38,7 @@ class DBSI_PhysicsDecoder(nn.Module):
         d_ax          = params[:, self.n_iso + 3]
         d_rad         = params[:, self.n_iso + 4]
 
-        # 1. Anisotropic Component (Fibers)
+        # 1. Anisotropic Component
         fiber_dir = torch.stack([
             torch.sin(theta) * torch.cos(phi),
             torch.sin(theta) * torch.sin(phi),
@@ -50,7 +50,7 @@ class DBSI_PhysicsDecoder(nn.Module):
         
         signal_fiber = f_fiber.unsqueeze(1) * torch.exp(-self.bvals.unsqueeze(0) * d_app_fiber)
 
-        # 2. Isotropic Component (Spectrum)
+        # 2. Isotropic Component
         basis_iso = torch.exp(-torch.ger(self.bvals, self.iso_diffusivities))
         signal_iso = torch.matmul(f_iso_weights, basis_iso.T)
 
@@ -59,8 +59,8 @@ class DBSI_PhysicsDecoder(nn.Module):
 
 class DBSI_RegularizedMLP(nn.Module):
     """
-    MLP Encoder with Architectural Regularization.
-    Maps raw DWI signal -> Physical DBSI parameters.
+    MLP Encoder with Delta-Parameterization.
+    Prevents 'dead gradients' by modeling D_ax as (D_rad + Delta).
     """
     def __init__(self, n_input_meas: int, n_iso_bases: int = 50, dropout_rate: float = 0.1):
         super().__init__()
@@ -97,20 +97,21 @@ class DBSI_RegularizedMLP(nn.Module):
         theta = self.sigmoid(raw[:, self.n_iso + 1]) * np.pi        
         phi   = (self.sigmoid(raw[:, self.n_iso + 2]) - 0.5) * 2 * np.pi
         
-        # 3. Diffusivities (RELAXED CONSTRAINTS)
-        # Modifica: Rilassiamo i vincoli per catturare fibre danneggiate
+        # 3. Diffusivities (DELTA PARAMETERIZATION)
+        # This ensures D_ax > D_rad mathematically, without breaking gradients.
         
-        # D_ax: [0.5 - 3.0] (Abbassiamo il minimo da 0.8 a 0.5)
-        d_ax_raw = self.sigmoid(raw[:, self.n_iso + 3])
-        d_ax = (d_ax_raw * 2.5e-3) + 0.5e-3    
-        
-        # D_rad: [0.0 - 1.0] (Alziamo il massimo da 0.8 a 1.0 per fibre demielinizzate)
+        # D_rad: [0.0 - 1.5] (Matches Two-Step NLLS range)
+        # Increased from 0.8/1.0 to allow fitting demyelinated/oedematous fibers
         d_rad_raw = self.sigmoid(raw[:, self.n_iso + 4])
-        d_rad = d_rad_raw * 1.0e-3
+        d_rad = d_rad_raw * 1.5e-3 
 
-        # Safety Check: Gap ridotto da 0.4 a 0.15
-        # Ora basta una piccola anisotropia per essere classificati come fibra
-        d_ax = torch.max(d_ax, d_rad + 0.15e-3) 
+        # Delta: [0.1 - 2.5] (Anisotropy Gap)
+        # Min gap 0.1 ensures it's never perfectly isotropic (avoids confusion with Hindered)
+        delta_raw = self.sigmoid(raw[:, self.n_iso + 3])
+        d_delta = (delta_raw * 2.4e-3) + 0.1e-3
+        
+        # D_ax is derived
+        d_ax = d_rad + d_delta
 
         return torch.cat([
             f_iso, 
@@ -142,12 +143,13 @@ class DBSI_DeepSolver:
     def fit_volume(self, volume: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray, mask: np.ndarray) -> Dict[str, np.ndarray]:
         
         print(f"[DeepSolver] Starting training on device: {DEVICE}")
-        print(f"[DeepSolver] Constraints: Relaxed (Gap > 0.15)")
+        print(f"[DeepSolver] Geometry: Delta-Parameterization (No Dead Gradients)")
         
         # 1. Data Preparation
         X_vol, Y_vol, Z_vol, N_meas = volume.shape
         valid_signals = volume[mask]
         
+        # Robust Normalization
         valid_signals = np.nan_to_num(valid_signals, nan=0.0, posinf=0.0, neginf=0.0)
         valid_signals = np.maximum(valid_signals, 0.0)
         
@@ -195,7 +197,6 @@ class DBSI_DeepSolver:
                 params_pred = encoder(noisy_input)
                 signal_recon = decoder(params_pred)
                 
-                # Loss: SOLO Ricostruzione (Nessuna Sparsity Loss)
                 loss = loss_fn(signal_recon, clean_signal)
                 
                 loss.backward()
@@ -243,7 +244,6 @@ class DBSI_DeepSolver:
         f_hin = np.sum(iso_weights[:, mask_hin], axis=1)
         f_wat = np.sum(iso_weights[:, mask_wat], axis=1)
         
-        # Directions
         dir_x = np.sin(theta) * np.cos(phi)
         dir_y = np.sin(theta) * np.sin(phi)
         dir_z = np.cos(theta)
