@@ -102,7 +102,7 @@ class DBSI_RegularizedMLP(nn.Module):
         # --- Physical Constraints (Hard Regularization) ---
         
         # 1. Fractions (must sum to 1)
-        # Use Softmax over ALL fractions (isotropic + fiber) to force competition
+        # Use Softmax over ALL fractions (isotropic + fiber)
         fractions_raw = raw[:, :self.n_iso + 1]
         fractions = torch.softmax(fractions_raw, dim=1)
         
@@ -116,19 +116,20 @@ class DBSI_RegularizedMLP(nn.Module):
         # 3. Diffusivities (STRICT CONSTRAINTS)
         # Force fiber geometry to be "tube-like" (Anisotropic)
         
-        # D_ax: Must be high (e.g. > 1.0 um2/ms).
-        # Sigmoid (0-1) * 2.0 + 1.0 -> Range [1.0, 3.0]
+        # D_ax: Must be high (e.g. > 0.8 um2/ms to allow injured axons).
+        # Sigmoid (0-1) * 2.2 + 0.8 -> Range [0.8, 3.0]
+        # Ho allargato leggermente il range inferiore (da 1.0 a 0.8) per accomodare fibre leggermente danneggiate
         d_ax_raw = self.sigmoid(raw[:, self.n_iso + 3])
-        d_ax = (d_ax_raw * 2.0e-3) + 1.0e-3    
+        d_ax = (d_ax_raw * 2.2e-3) + 0.8e-3    
         
         # D_rad: Must be low (e.g. < 0.8 um2/ms).
         # Sigmoid (0-1) * 0.8 -> Range [0.0, 0.8]
         d_rad_raw = self.sigmoid(raw[:, self.n_iso + 4])
         d_rad = d_rad_raw * 0.8e-3
 
-        # Safety Check: D_ax must always be > D_rad + significant margin
+        # Safety Check: D_ax must always be > D_rad + margin
         # This prevents the fiber from becoming a "ball" (isotropic)
-        d_ax = torch.max(d_ax, d_rad + 0.5e-3) 
+        d_ax = torch.max(d_ax, d_rad + 0.4e-3) 
 
         return torch.cat([
             f_iso, 
@@ -145,8 +146,8 @@ class DBSI_DeepSolver:
     Self-Supervised Solver with Denoising Regularization.
     """
     def __init__(self, 
-                 n_iso_bases: int = 20,  # Reduced default to avoid overfitting noise
-                 epochs: int = 150,      # Slightly increased
+                 n_iso_bases: int = 20,  # Keep low (20) to avoid overfitting
+                 epochs: int = 150,      
                  batch_size: int = 2048, 
                  learning_rate: float = 1e-3,
                  noise_injection_level: float = 0.02):
@@ -160,24 +161,21 @@ class DBSI_DeepSolver:
     def fit_volume(self, volume: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray, mask: np.ndarray) -> Dict[str, np.ndarray]:
         
         print(f"[DeepSolver] Starting training on device: {DEVICE}")
-        print(f"[DeepSolver] Constraints: D_ax [1.0-3.0], D_rad [0.0-0.8], Gap > 0.5")
+        print(f"[DeepSolver] Constraints: D_ax [0.8-3.0], D_rad [0.0-0.8], Gap > 0.4")
         
         # 1. Data Preparation
         X_vol, Y_vol, Z_vol, N_meas = volume.shape
         valid_signals = volume[mask]
         
         # Robust Normalization and Cleaning
-        # Remove NaNs and Infs that break training
         valid_signals = np.nan_to_num(valid_signals, nan=0.0, posinf=0.0, neginf=0.0)
-        # Remove negative values (physically impossible for magnitude signal)
         valid_signals = np.maximum(valid_signals, 0.0)
         
         b0_idx = np.where(bvals < 50)[0]
         if len(b0_idx) > 0:
             s0 = np.mean(valid_signals[:, b0_idx], axis=1, keepdims=True)
-            s0[s0 < 1e-3] = 1.0 # Avoid division by zero
+            s0[s0 < 1e-3] = 1.0
             valid_signals = valid_signals / s0
-            # Clip normalized signal (values > 1.5 are likely artifacts or noise)
             valid_signals = np.clip(valid_signals, 0, 1.5)
         
         # PyTorch Dataset
@@ -198,8 +196,6 @@ class DBSI_DeepSolver:
         ).to(DEVICE)
         
         optimizer = optim.AdamW(encoder.parameters(), lr=self.lr, weight_decay=1e-4)
-        
-        # Loss Function: L1 for robustness
         loss_fn = nn.L1Loss()
         
         # 3. Training Loop
@@ -212,7 +208,7 @@ class DBSI_DeepSolver:
             for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}", leave=False, file=sys.stdout):
                 clean_signal = batch[0].to(DEVICE)
                 
-                # Denoising: Noisy Input -> Clean Target
+                # Denoising
                 noise = torch.randn_like(clean_signal) * self.noise_level
                 noisy_input = clean_signal + noise
                 
@@ -222,17 +218,8 @@ class DBSI_DeepSolver:
                 params_pred = encoder(noisy_input)
                 signal_recon = decoder(params_pred)
                 
-                # Loss 1: Reconstruction
-                recon_loss = loss_fn(signal_recon, clean_signal)
-                
-                # Loss 2: Sparsity (New)
-                # Punishes unnecessary activation of multiple isotropic compartments
-                # Helps push unneeded fractions to zero (soft zeros -> hard zeros)
-                fractions_iso = params_pred[:, :self.n_iso_bases]
-                sparsity_loss = 1e-5 * torch.sum(torch.abs(fractions_iso))
-                
-                # Total Loss
-                loss = recon_loss + sparsity_loss
+                # Loss: Only Reconstruction (NO Sparsity bias)
+                loss = loss_fn(signal_recon, clean_signal)
                 
                 loss.backward()
                 optimizer.step()
