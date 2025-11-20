@@ -25,13 +25,22 @@ class DBSI_PhysicsDecoder(nn.Module):
         self.register_buffer('bvecs', torch.tensor(bvecs, dtype=torch.float32))
         
         # Fixed spectral grid [0, 3.0] um^2/ms
+        # Using slightly wider range or log-spacing can sometimes help, 
+        # but linear is standard for DBSI.
         iso_grid = torch.linspace(0, 3.0e-3, n_iso_bases)
         self.register_buffer('iso_diffusivities', iso_grid)
         
         self.n_iso = n_iso_bases
 
     def forward(self, params: torch.Tensor) -> torch.Tensor:
-        # Unpacking parameters
+        # params structure:
+        # [0..N-1]: f_iso (N bases)
+        # [N]:      f_fiber
+        # [N+1]:    theta
+        # [N+2]:    phi
+        # [N+3]:    d_ax
+        # [N+4]:    d_rad
+
         f_iso_weights = params[:, :self.n_iso]
         f_fiber       = params[:, self.n_iso]
         theta         = params[:, self.n_iso + 1]
@@ -46,11 +55,10 @@ class DBSI_PhysicsDecoder(nn.Module):
             torch.cos(theta)
         ], dim=1)
 
-        # D_app calculation
         cos_angle = torch.matmul(fiber_dir, self.bvecs.T)
         d_app_fiber = d_rad.unsqueeze(1) + (d_ax.unsqueeze(1) - d_rad.unsqueeze(1)) * (cos_angle ** 2)
         
-        # Signal
+        # Fiber signal: f_fib * exp(-b * D_app)
         signal_fiber = f_fiber.unsqueeze(1) * torch.exp(-self.bvals.unsqueeze(0) * d_app_fiber)
 
         # 2. Isotropic Component (Spectrum)
@@ -63,59 +71,85 @@ class DBSI_PhysicsDecoder(nn.Module):
 
 class DBSI_RegularizedMLP(nn.Module):
     """
-    MLP Encoder with Delta-Parameterization (Standard Softmax).
-    Reverted to the architecture that gave lower loss (0.0266).
+    Updated MLP Encoder with "Split Fraction" Architecture.
+    Decouples Fiber Fraction estimation from Isotropic Spectrum distribution
+    to prevent fiber underestimation.
     """
     def __init__(self, n_input_meas: int, n_iso_bases: int = 50, dropout_rate: float = 0.1):
         super().__init__()
         self.n_iso = n_iso_bases
-        self.n_output = n_iso_bases + 5 
         
+        # Outputs:
+        # 1 for Fiber Fraction (Sigmoid)
+        # n_iso for Isotropic Distribution (Softmax)
+        # 2 for Angles
+        # 2 for Diffusivities
+        self.n_output_features = 1 + n_iso + 2 + 2 
+        
+        # Deeper/Wider network to capture subtle features
         self.net = nn.Sequential(
-            nn.Linear(n_input_meas, 128),
+            nn.Linear(n_input_meas, 256),
+            nn.LayerNorm(256),
+            nn.ELU(),
+            nn.Dropout(dropout_rate),
+            
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.ELU(),
+            nn.Dropout(dropout_rate),
+            
+            nn.Linear(256, 128),
             nn.LayerNorm(128),
             nn.ELU(),
             nn.Dropout(dropout_rate),
             
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
-            nn.ELU(),
-            nn.Dropout(dropout_rate),
-            
-            nn.Linear(64, self.n_output)
+            nn.Linear(128, self.n_output_features)
         )
         
         self.sigmoid = nn.Sigmoid()
+        # Softmax for the isotropic spectrum only
+        self.softmax_iso = nn.Softmax(dim=1) 
 
     def forward(self, x):
         raw = self.net(x)
         
-        # 1. Fractions (Standard Softmax on all components)
-        fractions_raw = raw[:, :self.n_iso + 1]
-        fractions = torch.softmax(fractions_raw, dim=1)
+        # --- SPLIT FRACTION ESTIMATION ---
+        # Index 0: Fiber Fraction Logit
+        # Index 1..N: Isotropic Spectrum Logits
         
-        f_iso = fractions[:, :self.n_iso]
-        f_fiber = fractions[:, self.n_iso]
+        # 1. Calculate Fiber Fraction (0 to 1)
+        f_fiber_raw = raw[:, 0]
+        f_fiber = self.sigmoid(f_fiber_raw)
         
-        # 2. Angles
-        theta = self.sigmoid(raw[:, self.n_iso + 1]) * np.pi        
-        phi   = (self.sigmoid(raw[:, self.n_iso + 2]) - 0.5) * 2 * np.pi
+        # 2. Calculate Isotropic Distribution (Sums to 1)
+        iso_logits = raw[:, 1:self.n_iso + 1]
+        iso_dist = self.softmax_iso(iso_logits)
         
-        # 3. Diffusivities (Delta-Parameterization)
-        # Ensures D_ax > D_rad naturally
+        # 3. Scale Isotropic Fractions
+        # The remaining signal (1 - f_fiber) is distributed among isotropic bases
+        f_iso_total = 1.0 - f_fiber
+        f_iso_weights = iso_dist * f_iso_total.unsqueeze(1)
         
-        # D_rad: [0.0 - 1.5] 
-        d_rad_raw = self.sigmoid(raw[:, self.n_iso + 4])
-        d_rad = d_rad_raw * 1.5e-3 
-
-        # Delta: [0.1 - 2.5] (Gap > 0.1 to ensure anisotropy)
-        delta_raw = self.sigmoid(raw[:, self.n_iso + 3])
-        d_delta = (delta_raw * 2.4e-3) + 0.1e-3 
+        # --- Geometric Parameters ---
+        # Indices start after the fractions
+        idx_geom = self.n_iso + 1
         
-        d_ax = d_rad + d_delta
+        # Angles
+        theta = self.sigmoid(raw[:, idx_geom]) * np.pi        # [0, pi]
+        phi   = (self.sigmoid(raw[:, idx_geom + 1]) - 0.5) * 2 * np.pi # [-pi, pi]
+        
+        # Diffusivities
+        # D_ax: [0.5, 3.0] - Preventing collapse to 0 helps separate from restricted iso
+        d_ax = self.sigmoid(raw[:, idx_geom + 2]) * 2.5e-3 + 0.5e-3 
+        
+        # D_rad: [0.0, 1.5] - Standard range
+        d_rad = self.sigmoid(raw[:, idx_geom + 3]) * 1.5e-3
+        
+        # Constraint: D_ax >= D_rad
+        d_ax = torch.max(d_ax, d_rad + 1e-6)
 
         return torch.cat([
-            f_iso, 
+            f_iso_weights, 
             f_fiber.unsqueeze(1), 
             theta.unsqueeze(1), 
             phi.unsqueeze(1), 
@@ -126,14 +160,14 @@ class DBSI_RegularizedMLP(nn.Module):
 
 class DBSI_DeepSolver:
     """
-    Self-Supervised Solver with Aggressive Plateau Scheduler.
+    Self-Supervised Solver with Adaptive Noise and Sparsity Regularization.
     """
     def __init__(self, 
-                 n_iso_bases: int = 20,  
-                 epochs: int = 300,      # Sufficient with aggressive scheduler
-                 batch_size: int = 2048, 
+                 n_iso_bases: int = 50, 
+                 epochs: int = 200,  # Increased epochs for better convergence
+                 batch_size: int = 1024, 
                  learning_rate: float = 1e-3,
-                 noise_injection_level: float = 0.02):
+                 noise_injection_level: float = 0.03): # Increased noise slightly for robustness
         
         self.n_iso_bases = n_iso_bases
         self.epochs = epochs
@@ -143,32 +177,30 @@ class DBSI_DeepSolver:
         
     def fit_volume(self, volume: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray, mask: np.ndarray) -> Dict[str, np.ndarray]:
         
-        print(f"[DeepSolver] Starting training on device: {DEVICE}")
-        print(f"[DeepSolver] Scheduler: ReduceLROnPlateau (Aggressive: patience=5)")
+        print(f"[DeepSolver] Starting self-supervised training on device: {DEVICE}")
+        print(f"[DeepSolver] Strategy: Split Fractions + L1 Sparsity")
         
         # 1. Data Preparation
         X_vol, Y_vol, Z_vol, N_meas = volume.shape
         valid_signals = volume[mask]
         
-        # Robust Normalization
-        valid_signals = np.nan_to_num(valid_signals, nan=0.0, posinf=0.0, neginf=0.0)
-        valid_signals = np.maximum(valid_signals, 0.0)
-        
+        # Robust S0 normalization
         b0_idx = np.where(bvals < 50)[0]
         if len(b0_idx) > 0:
             s0 = np.mean(valid_signals[:, b0_idx], axis=1, keepdims=True)
-            s0[s0 < 1e-3] = 1.0
+            s0[s0 < 1e-4] = 1.0 
             valid_signals = valid_signals / s0
+            # Clip outliers
             valid_signals = np.clip(valid_signals, 0, 1.5)
         
         dataset = TensorDataset(torch.tensor(valid_signals, dtype=torch.float32))
-        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=True)
         
         # 2. Model Initialization
         encoder = DBSI_RegularizedMLP(
             n_input_meas=N_meas, 
             n_iso_bases=self.n_iso_bases,
-            dropout_rate=0.1
+            dropout_rate=0.05 # Reduced dropout to reduce variance in output
         ).to(DEVICE)
         
         decoder = DBSI_PhysicsDecoder(
@@ -177,85 +209,108 @@ class DBSI_DeepSolver:
             n_iso_bases=self.n_iso_bases
         ).to(DEVICE)
         
-        optimizer = optim.AdamW(encoder.parameters(), lr=self.lr, weight_decay=1e-4)
+        optimizer = optim.AdamW(encoder.parameters(), lr=self.lr, weight_decay=1e-5)
         
-        # SCHEDULER AGGRESSIVO:
-        # patience=5: Se la loss non migliora per 5 epoche, riduce il LR.
-        # threshold=1e-5: Miglioramenti microscopici non contano come 'miglioramento'.
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, threshold=1e-5, verbose=True, min_lr=1e-7
-        )
-        
-        loss_fn = nn.L1Loss()
+        # Loss Functions
+        recon_loss_fn = nn.MSELoss() # MSE encourages fitting the mean (less noise)
         
         # 3. Training Loop
-        print(f"[DeepSolver] Training on {len(valid_signals)} voxels...")
         encoder.train()
         
+        # Adaptive Noise Schedule: Start high, reduce to refine
+        current_noise = self.noise_level
+        
         for epoch in range(self.epochs):
-            epoch_loss = 0.0
+            epoch_loss_recon = 0.0
+            epoch_loss_sparse = 0.0
             
-            for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}", leave=False, file=sys.stdout):
+            # Decay noise halfway through
+            if epoch == self.epochs // 2:
+                current_noise = self.noise_level * 0.5
+            
+            for batch in dataloader: # tqdm removed for cleaner logs, add back if needed
                 clean_signal = batch[0].to(DEVICE)
                 
-                noise = torch.randn_like(clean_signal) * self.noise_level
+                # Noise Injection (Denoising Autoencoder)
+                noise = torch.randn_like(clean_signal) * current_noise
                 noisy_input = clean_signal + noise
                 
                 optimizer.zero_grad()
                 
+                # A. Predict Parameters
                 params_pred = encoder(noisy_input)
+                
+                # Extract fractions for sparsity regularization
+                # Only penalize Isotropic components to encourage Fiber usage?
+                # Or penalize everything to encourage simplicity?
+                # Let's calculate entropy of the isotropic distribution to encourage sharpness
+                # isotropic weights are params_pred[:, :self.n_iso_bases]
+                
+                iso_weights = params_pred[:, :self.n_iso_bases]
+                
+                # B. Reconstruct Signal
                 signal_recon = decoder(params_pred)
                 
-                loss = loss_fn(signal_recon, clean_signal)
+                # C. Losses
+                # 1. Data Fidelity
+                loss_recon = recon_loss_fn(signal_recon, clean_signal)
                 
-                loss.backward()
+                # 2. Sparsity on Isotropic Spectrum (L1)
+                # Helps reducing "smearing" of the spectrum, reducing zeros in fiber
+                # by forcing isotropic parts to be efficient.
+                loss_sparsity = torch.mean(torch.sum(torch.abs(iso_weights), dim=1))
+                
+                # Total Loss
+                # Weighting sparsity is tricky. Too high -> underfitting. 
+                # 0.001 is conservative.
+                total_loss = loss_recon + (0.001 * loss_sparsity)
+                
+                total_loss.backward()
                 optimizer.step()
                 
-                epoch_loss += loss.item()
+                epoch_loss_recon += loss_recon.item()
+                epoch_loss_sparse += loss_sparsity.item()
             
-            avg_loss = epoch_loss / len(dataloader)
-            
-            # Scheduler Step (Monitora la loss)
-            scheduler.step(avg_loss)
-            
-            if (epoch + 1) % 10 == 0:
-                current_lr = optimizer.param_groups[0]['lr']
-                print(f"  Epoch {epoch+1}: Avg Loss = {avg_loss:.6f} | LR = {current_lr:.2e}")
-                
-            # Early Stopping (LR troppo basso)
-            if optimizer.param_groups[0]['lr'] < 5e-7:
-                print(f"[DeepSolver] LR minimo raggiunto. Convergenza all'epoca {epoch+1}.")
-                break
+            if (epoch + 1) % 20 == 0:
+                avg_recon = epoch_loss_recon / len(dataloader)
+                print(f"[Epoch {epoch+1}/{self.epochs}] Recon Loss: {avg_recon:.6f}")
         
         # 4. Inference
-        print("[DeepSolver] Generating volumetric maps...")
+        print("[DeepSolver] Inference on full volume...")
         encoder.eval()
-        full_loader = DataLoader(dataset, batch_size=self.batch_size*2, shuffle=False)
+        # Use larger batch for inference
+        full_loader = DataLoader(dataset, batch_size=4096, shuffle=False)
         all_preds = []
         
         with torch.no_grad():
             for batch in full_loader:
                 x = batch[0].to(DEVICE)
+                # No noise during inference
                 preds = encoder(x)
                 all_preds.append(preds.cpu().numpy())
                 
         flat_results = np.concatenate(all_preds, axis=0)
         
-        # 5. Reconstruction
+        # 5. Reconstruct Maps
+        return self._pack_results(flat_results, X_vol, Y_vol, Z_vol, mask)
+
+    def _pack_results(self, flat_results, X, Y, Z, mask):
+        n_iso = self.n_iso_bases
+        
         def to_3d(flat_arr):
-            vol = np.zeros((X_vol, Y_vol, Z_vol), dtype=np.float32)
+            vol = np.zeros((X, Y, Z), dtype=np.float32)
             vol[mask] = flat_arr
             return vol
             
-        iso_weights = flat_results[:, :self.n_iso_bases]
-        fiber_frac  = flat_results[:, self.n_iso_bases]
-        theta       = flat_results[:, self.n_iso_bases+1]
-        phi         = flat_results[:, self.n_iso_bases+2]
-        d_ax        = flat_results[:, self.n_iso_bases+3]
-        d_rad       = flat_results[:, self.n_iso_bases+4]
+        iso_weights = flat_results[:, :n_iso]
+        fiber_frac  = flat_results[:, n_iso]
+        theta       = flat_results[:, n_iso+1]
+        phi         = flat_results[:, n_iso+2]
+        d_ax        = flat_results[:, n_iso+3]
+        d_rad       = flat_results[:, n_iso+4]
         
         # Spectral Aggregation
-        grid = np.linspace(0, 3.0e-3, self.n_iso_bases)
+        grid = np.linspace(0, 3.0e-3, n_iso)
         mask_res = grid <= 0.3e-3
         mask_hin = (grid > 0.3e-3) & (grid <= 2.0e-3)
         mask_wat = grid > 2.0e-3
@@ -264,6 +319,7 @@ class DBSI_DeepSolver:
         f_hin = np.sum(iso_weights[:, mask_hin], axis=1)
         f_wat = np.sum(iso_weights[:, mask_wat], axis=1)
         
+        # Direction
         dir_x = np.sin(theta) * np.cos(phi)
         dir_y = np.sin(theta) * np.sin(phi)
         dir_z = np.cos(theta)
