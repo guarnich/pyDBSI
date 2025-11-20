@@ -1,3 +1,56 @@
+# dbsi_toolbox/deep_learning.py
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from torch.utils.data import TensorDataset, DataLoader
+from tqdm import tqdm
+import sys
+from typing import Dict
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class DBSI_PhysicsDecoder(nn.Module):
+    def __init__(self, bvals: np.ndarray, bvecs: np.ndarray, n_iso_bases: int = 20):
+        super().__init__()
+        self.register_buffer('bvals', torch.tensor(bvals, dtype=torch.float32))
+        self.register_buffer('bvecs', torch.tensor(bvecs, dtype=torch.float32))
+        
+        # Grid standard
+        self.iso_grid_np = np.linspace(0, 3.0e-3, n_iso_bases)
+        self.register_buffer('iso_diffusivities', torch.tensor(self.iso_grid_np, dtype=torch.float32))
+        self.n_iso = n_iso_bases
+
+    def forward(self, params: torch.Tensor) -> torch.Tensor:
+        # Unpack params
+        # [0..N-1] iso_weights
+        # [N] f_fiber
+        # [N+1..] geometry
+        f_iso_weights = params[:, :self.n_iso]
+        f_fiber       = params[:, self.n_iso]
+        theta         = params[:, self.n_iso + 1]
+        phi           = params[:, self.n_iso + 2]
+        d_ax          = params[:, self.n_iso + 3]
+        d_rad         = params[:, self.n_iso + 4]
+
+        # Anisotropic
+        fiber_dir = torch.stack([
+            torch.sin(theta) * torch.cos(phi),
+            torch.sin(theta) * torch.sin(phi),
+            torch.cos(theta)
+        ], dim=1)
+        cos_angle = torch.matmul(fiber_dir, self.bvecs.T)
+        d_app_fiber = d_rad.unsqueeze(1) + (d_ax.unsqueeze(1) - d_rad.unsqueeze(1)) * (cos_angle ** 2)
+        signal_fiber = f_fiber.unsqueeze(1) * torch.exp(-self.bvals.unsqueeze(0) * d_app_fiber)
+
+        # Isotropic
+        basis_iso = torch.exp(-torch.ger(self.bvals, self.iso_diffusivities))
+        signal_iso = torch.matmul(f_iso_weights, basis_iso.T)
+
+        return signal_fiber + signal_iso
+
+
 class DBSI_RegularizedMLP(nn.Module):
     """
     Macro-Compartment Architecture with Tighter Physical Constraints.
@@ -105,3 +158,116 @@ class DBSI_RegularizedMLP(nn.Module):
             d_ax.unsqueeze(1), 
             d_rad.unsqueeze(1)
         ], dim=1)
+
+class DBSI_DeepSolver:
+    def __init__(self, n_iso_bases: int = 20, epochs: int = 300, batch_size: int = 2048, learning_rate: float = 1e-3, noise_injection_level: float = 0.03):
+        self.n_iso_bases = n_iso_bases
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = learning_rate
+        self.noise_level = noise_injection_level
+        
+    def fit_volume(self, volume: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray, mask: np.ndarray) -> Dict[str, np.ndarray]:
+        print(f"[DeepSolver] Strategy: Grouped Architecture + L2 Ridge Regularization")
+        
+        # Data Prep
+        X_vol, Y_vol, Z_vol, N_meas = volume.shape
+        valid_signals = volume[mask]
+        
+        b0_idx = np.where(bvals < 50)[0]
+        if len(b0_idx) > 0:
+            s0 = np.mean(valid_signals[:, b0_idx], axis=1, keepdims=True)
+            s0[s0 < 1e-4] = 1.0 
+            valid_signals = valid_signals / s0
+            valid_signals = np.clip(valid_signals, 0, 1.5)
+        
+        dataset = TensorDataset(torch.tensor(valid_signals, dtype=torch.float32))
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=True)
+        
+        # Models
+        encoder = DBSI_RegularizedMLP(N_meas, self.n_iso_bases).to(DEVICE)
+        decoder = DBSI_PhysicsDecoder(bvals, bvecs, self.n_iso_bases).to(DEVICE)
+        optimizer = optim.AdamW(encoder.parameters(), lr=self.lr)
+        loss_mse = nn.MSELoss()
+        
+        # Training
+        encoder.train()
+        current_noise = self.noise_level
+        pbar = tqdm(range(self.epochs), desc="DL Optimization", unit="epoch", file=sys.stdout)
+        
+        for epoch in pbar:
+            batch_loss = 0.0
+            if epoch > self.epochs // 2: current_noise = self.noise_level * 0.5
+            if epoch > self.epochs * 0.8: current_noise = 0.0
+            
+            for batch in dataloader:
+                clean = batch[0].to(DEVICE)
+                noise = torch.randn_like(clean) * current_noise
+                
+                optimizer.zero_grad()
+                preds = encoder(clean + noise)
+                
+                # Reconstruction Loss
+                recon = decoder(preds)
+                l_fit = loss_mse(recon, clean)
+                
+                # L2 Regularization on Spectrum (Ridge)
+                # Instead of forcing zeros (L1/Entropy), we force "smoothness" (L2).
+                # This prevents the network from zeroing out Restricted/Water 
+                # just because Hindered is dominant.
+                iso_weights = preds[:, :self.n_iso_bases]
+                l_reg = torch.mean(iso_weights ** 2)
+                
+                loss = l_fit + (0.01 * l_reg) # 0.01 weight for L2
+                
+                loss.backward()
+                optimizer.step()
+                batch_loss += l_fit.item()
+            
+            pbar.set_postfix({"MSE": f"{batch_loss/len(dataloader):.6f}"})
+            
+        # Inference
+        print("Inference...")
+        encoder.eval()
+        full_loader = DataLoader(dataset, batch_size=4096, shuffle=False)
+        res = []
+        with torch.no_grad():
+            for batch in full_loader:
+                res.append(encoder(batch[0].to(DEVICE)).cpu().numpy())
+        return self._pack_results(np.concatenate(res, axis=0), X_vol, Y_vol, Z_vol, mask)
+
+    def _pack_results(self, flat_results, X, Y, Z, mask):
+        def to_3d(flat_arr):
+            vol = np.zeros((X, Y, Z), dtype=np.float32)
+            vol[mask] = flat_arr
+            return vol
+            
+        n = self.n_iso_bases
+        iso_w = flat_results[:, :n]
+        f_fib = flat_results[:, n]
+        d_ax  = flat_results[:, n+3]
+        d_rad = flat_results[:, n+4]
+        
+        grid = np.linspace(0, 3.0e-3, n)
+        mask_res = grid <= 0.3e-3
+        mask_hin = (grid > 0.3e-3) & (grid <= 2.0e-3)
+        mask_wat = grid > 2.0e-3
+        
+        # Direction extraction
+        theta = flat_results[:, n+1]
+        phi   = flat_results[:, n+2]
+        dx = np.sin(theta)*np.cos(phi)
+        dy = np.sin(theta)*np.sin(phi)
+        dz = np.cos(theta)
+        
+        return {
+            'restricted_fraction': to_3d(np.sum(iso_w[:, mask_res], axis=1)),
+            'hindered_fraction':   to_3d(np.sum(iso_w[:, mask_hin], axis=1)),
+            'water_fraction':      to_3d(np.sum(iso_w[:, mask_wat], axis=1)),
+            'fiber_fraction':      to_3d(f_fib),
+            'axial_diffusivity':   to_3d(d_ax),
+            'radial_diffusivity':  to_3d(d_rad),
+            'fiber_dir_x':         to_3d(dx),
+            'fiber_dir_y':         to_3d(dy),
+            'fiber_dir_z':         to_3d(dz)
+        }
