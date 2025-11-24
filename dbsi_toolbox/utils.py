@@ -24,7 +24,7 @@ def load_dwi_data_dipy(
     f_bval: str, 
     f_bvec: str, 
     f_mask: str 
-) -> Tuple[np.ndarray, np.ndarray, 'GradientTable', np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, 'GradientTable', np.ndarray]: #type: ignore
     """
     Loads DWI data, bvals, bvecs, and the MANDATORY brain mask using DIPY.
     
