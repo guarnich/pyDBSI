@@ -3,7 +3,8 @@
 import os
 import numpy as np
 import nibabel as nib
-from typing import Tuple, Optional
+from typing import Tuple
+from scipy.ndimage import binary_dilation
 
 # Import DIPY functions for compatibility
 try:
@@ -23,23 +24,35 @@ def load_dwi_data_dipy(
     f_bval: str, 
     f_bvec: str, 
     f_mask: str 
-) -> Tuple[np.ndarray, np.ndarray, 'GradientTable', Optional[np.ndarray]]: # type: ignore
+) -> Tuple[np.ndarray, np.ndarray, 'GradientTable', np.ndarray]:
     """
-    Loads DWI data, bvals, bvecs, and an optional mask using DIPY.
+    Loads DWI data, bvals, bvecs, and the MANDATORY brain mask using DIPY.
     
     Args:
-        f_nifti: Path to the 4D NIfTI file (.nii or .nii.gz)
-        f_bval: Path to the .bval file
-        f_bvec: Path to the .bvec file
-        f_mask: Optional path to the 3D NIfTI mask file
+        f_nifti: Path to the 4D NIfTI file.
+        f_bval: Path to the .bval file.
+        f_bvec: Path to the .bvec file.
+        f_mask: Path to the 3D NIfTI mask file (REQUIRED).
         
     Returns:
         A tuple containing:
         - data (np.ndarray): 4D DWI data
         - affine (np.ndarray): Affine matrix
         - gtab (GradientTable): DIPY gradient table object
-        - mask (np.ndarray | None): 3D boolean mask or None
+        - mask (np.ndarray): 3D boolean mask
+        
+    Raises:
+        ValueError: If f_mask is not provided or file logic fails.
     """
+    # --- 1. STRICT INPUT CHECK (BLOCKING) ---
+    if not f_mask:
+        raise ValueError(
+            "\n[CRITICAL ERROR] Brain Mask is MISSING.\n"
+            "The DBSI pipeline requires a valid brain mask to accurately estimate SNR "
+            "and perform voxel-wise fitting.\n"
+            "Execution stopped. Please provide a mask using the --mask argument."
+        )
+
     print(f"[Utils] Loading data from: {f_nifti}")
     data, affine = load_nifti(f_nifti)
     
@@ -52,44 +65,74 @@ def load_dwi_data_dipy(
     print(f"  ✓ Volume: {data.shape}, Bvals: {len(gtab.bvals)}, Bvecs: {gtab.bvecs.shape}")
     print(f"  ✓ No. of b=0 volumes: {np.sum(gtab.b0s_mask)}")
     
-    mask_data = None
-    if f_mask:
-        print(f"[Utils] Loading mask from: {f_mask}")
-        mask_data, mask_affine = load_nifti(f_mask)
-        mask_data = mask_data.astype(bool)
-        
-        # Validation
-        if mask_data.shape != data.shape[:3]:
-            raise ValueError(
-                f"Mask shape {mask_data.shape} does not match "
-                f"data shape {data.shape[:3]}"
-            )
-        print(f"  ✓ Mask: {mask_data.shape}, Voxels: {np.sum(mask_data):,}")
+    print(f"[Utils] Loading MANDATORY mask from: {f_mask}")
+    mask_data, mask_affine = load_nifti(f_mask)
+    mask_data = mask_data.astype(bool)
+    
+    # Dimensionality Validation
+    if mask_data.shape != data.shape[:3]:
+        raise ValueError(
+            f"Mask shape {mask_data.shape} does not match "
+            f"data shape {data.shape[:3]}"
+        )
+    print(f"  ✓ Mask loaded successfully: {np.sum(mask_data):,} voxels.")
     
     return data, affine, gtab, mask_data
+
+
+def _get_signal_bbox(data: np.ndarray, margin: int = 20) -> Tuple[slice, slice, slice]:
+    """
+    Calculates a bounding box around non-zero signal (Automatic Signal ROI).
+    Adds a safety margin to ensure background air is included for noise estimation.
+    """
+    # Identify all pixels with signal > 0 (The Head/Object)
+    coords = np.array(np.nonzero(data))
+    
+    if coords.size == 0:
+        # Fallback to full image if data is empty
+        return (slice(None), slice(None), slice(None))
+
+    min_coords = coords.min(axis=1)
+    max_coords = coords.max(axis=1) + 1 # slice exclusive
+    
+    # Expand by margin (e.g. 20 voxels) to keep air around the head
+    min_coords = np.maximum(0, min_coords - margin)
+    max_coords = np.minimum(data.shape, max_coords + margin)
+    
+    return tuple(slice(min_c, max_c) for min_c, max_c in zip(min_coords, max_coords))
+
 
 def estimate_snr(
     data: np.ndarray, 
     gtab: 'GradientTable', #type: ignore
-    mask: Optional[np.ndarray] = None
+    affine: np.ndarray,
+    mask: np.ndarray
 ) -> float:
     """
-    Estimates SNR (Signal-to-Noise Ratio) using b=0 images.
+    Estimates SNR (Signal-to-Noise Ratio) using b=0 images on an optimized FOV.
     
     Strategy:
-    1. If >= 3 b=0 volumes: Use 'temporal' method (Voxel-wise Mean/Std).
-    2. If < 3 b=0 volumes: Use 'spatial' method (Signal ROI / Background Noise).
+    1. ROI Optimization: Computes a bounding box around non-zero signal (+ margin)
+       to exclude far-field zeros/artifacts (Automatic Signal ROI).
+    2. If >= 3 b=0 volumes: Use 'temporal' method (Voxel-wise Mean/Std).
+    3. If < 3 b=0 volumes: Use 'spatial' method (Signal ROI / Background Noise).
+       Spatial method expands the mask by ~15mm to exclude scalp/eyes from background.
     
     Args:
         data: 4D DWI volume (X, Y, Z, N)
         gtab: DIPY GradientTable
-        mask: 3D binary mask of the brain (optional but recommended)
+        affine: 4x4 Affine matrix to determine voxel size in mm
+        mask: 3D binary mask of the brain (MANDATORY)
         
     Returns:
         float: Estimated SNR.
     """
     print("\n[Utils] Automatically estimating SNR...")
     
+    # STRICT CHECK
+    if mask is None:
+        raise ValueError("[CRITICAL] SNR estimation stopped: No brain mask provided.")
+
     # 1. Extract b=0 volumes
     b0_mask = gtab.b0s_mask
     b0_data = data[..., b0_mask]
@@ -99,67 +142,92 @@ def estimate_snr(
         print("  ! WARNING: No b=0 volumes found. Returning default SNR = 30.0")
         return 30.0
 
-    # 2. Handle Mask (if not provided, create simple intensity-based mask)
-    if mask is None:
-        print("  ! Mask not provided. Calculating basic mask (Otsu thresholding)...")
-        from dipy.segment.mask import median_otsu
-        # Use the first b0 to create the mask
-        _, mask = median_otsu(b0_data[..., 0], median_radius=2, numpass=1)
+    # 2. Calculate Mean b0 for ROI definition
+    mean_b0_full = np.mean(b0_data, axis=-1)
 
-    # Ensure mask is boolean
-    mask = mask.astype(bool)
-    if np.sum(mask) == 0:
-        print("  ! Empty mask. Cannot calculate SNR. Returning default = 30.0")
-        return 30.0
+    # 3. Define Automatic Signal FOV (Bounding Box of non-zero signal + margin)
+    # We exclude pure zeros (padding) but keep air around the head for noise estimation.
+    bbox = _get_signal_bbox(mean_b0_full, margin=20)
+    
+    # Crop data to this optimized FOV
+    b0_data_cropped = b0_data[bbox]
+    mask_cropped = mask[bbox]
+    mean_b0_cropped = mean_b0_full[bbox]
+    
+    vol_reduction = 100 * (1 - (b0_data_cropped.size / b0_data.size))
+    print(f"  ✓ Signal ROI Optimization: Cropped FOV to valid signal area (Volume reduced by {vol_reduction:.1f}%).")
 
     snr_est = 0.0
 
-    # --- METHOD 1: Temporal SNR (if enough b0s) ---
+    # --- METHOD 1: Temporal SNR (Preferred if enough b0s) ---
     if n_b0 >= 3:
         print(f"  ✓ Method: Temporal (based on {n_b0} b=0 volumes)")
-        # Calculate mean and std along the temporal dimension (4th dim)
-        mean_b0 = np.mean(b0_data, axis=-1)
-        std_b0 = np.std(b0_data, axis=-1)
+        
+        # Calculate voxel-wise stats on cropped data
+        std_b0 = np.std(b0_data_cropped, axis=-1)
         
         # Avoid division by zero
         std_b0[std_b0 == 0] = 1e-10
         
         # Voxel-wise SNR
-        snr_map = mean_b0 / std_b0
+        snr_map = mean_b0_cropped / std_b0
         
-        # Take median SNR only inside the brain mask
-        snr_est = np.median(snr_map[mask])
-        print(f"  ✓ Calculated SNR (Voxel-wise Median): {snr_est:.2f}")
+        # Median SNR inside the brain mask
+        if np.sum(mask_cropped) > 0:
+            snr_est = np.median(snr_map[mask_cropped])
+            print(f"  ✓ Calculated SNR (Voxel-wise Median): {snr_est:.2f}")
+        else:
+            print("  ! Warning: Cropped mask is empty. Defaulting to 30.0")
+            snr_est = 30.0
 
     # --- METHOD 2: Spatial SNR (Signal/Background) ---
     else:
         print(f"  ✓ Method: Spatial (few b0s available: {n_b0})")
-        # Use mean of all available b0s to reduce visual noise
-        mean_b0 = np.mean(b0_data, axis=-1)
         
-        # Signal: Mean intensity inside the mask
-        signal_mean = np.mean(mean_b0[mask])
+        # Calculate voxel dimensions (mm)
+        voxel_sizes = np.sqrt(np.sum(affine[:3, :3] ** 2, axis=0))
+        mean_vox_dim = np.mean(voxel_sizes)
         
-        # Noise: Standard deviation outside the mask (Background)
-        # For simplicity, using the inverse of the mask
-        background_mask = ~mask
+        # Dilation Strategy: 15mm to exclude scalp/eyes/fat
+        target_dist_mm = 15.0
+        n_iter = int(np.ceil(target_dist_mm / mean_vox_dim))
         
-        # Remove artifacts (zero/NaN)
-        noise_data = mean_b0[background_mask]
+        print(f"  ✓ Expanding mask by {target_dist_mm}mm ({n_iter} voxels) to identify safe background...")
+        
+        # Create Dilated Mask (Brain + Scalp + Margin) within the cropped FOV
+        dilated_mask = binary_dilation(mask_cropped, iterations=n_iter)
+        
+        # Background is everything OUTSIDE the dilated mask (True Air)
+        # inside our Optimized Signal FOV
+        background_mask = ~dilated_mask
+        
+        # Signal: Mean intensity inside the ORIGINAL brain mask
+        signal_mean = np.mean(mean_b0_cropped[mask_cropped])
+        
+        # Noise: Standard deviation in the SAFE background (Air)
+        noise_data = mean_b0_cropped[background_mask]
+        
+        # Remove artifacts (zero padding/NaNs) if any remain
         noise_data = noise_data[noise_data > 0] 
         
-        if len(noise_data) == 0:
-             print("  ! Unable to find valid background noise. Returning default = 30.0")
+        if len(noise_data) < 100:
+             print("  ! CRITICAL: Optimized FOV has insufficient background for noise estimation.")
+             print("  ! Returning default SNR = 30.0")
              return 30.0
              
         noise_std = np.std(noise_data)
         
-        # Correction for Rician/Rayleigh noise in magnitude images (background)
+        # Correction for Rician/Rayleigh noise in magnitude images
         # Real_SD = Background_SD / 0.655
         noise_std_corrected = noise_std / 0.655
         
-        snr_est = signal_mean / noise_std_corrected
-        print(f"  ✓ Mean Signal: {signal_mean:.2f}, Noise Std (corr): {noise_std_corrected:.2f}")
+        if noise_std_corrected == 0:
+            snr_est = 30.0
+        else:
+            snr_est = signal_mean / noise_std_corrected
+            
+        print(f"  ✓ Mean Signal (Brain): {signal_mean:.2f}")
+        print(f"  ✓ Noise Std (Air, corrected): {noise_std_corrected:.2f}")
         print(f"  ✓ Calculated SNR: {snr_est:.2f}")
 
     # Safety limits (Sanity Check)
@@ -167,7 +235,7 @@ def estimate_snr(
         print("  ! Very low SNR detected (<5). Might be an error. Clamping to 5.0.")
         snr_est = 5.0
     elif snr_est > 100.0:
-        print("  ! Very high SNR detected (>100). Possible bad mask or synthetic data. Clamping to 100.0.")
+        print("  ! Very high SNR detected (>100). Possible synthetic data. Clamping to 100.0.")
         snr_est = 100.0
         
     return float(snr_est)
