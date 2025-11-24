@@ -81,7 +81,7 @@ python examples/run_dbsi.py \
     --mask "mask.nii.gz" \
     --out  "results/" \
     --snr 20.0 \
-    --mc_iter 100
+    --mc_iter 1000
 ```
 
 This command will fit the DBSI model to every voxel inside the mask and save parameter maps (e.g., `dbsi_fiber_fraction.nii.gz`, `dbsi_restricted_fraction.nii.gz`, etc.) along with a `pipeline_info.json` metadata file in the output folder.
