@@ -13,7 +13,7 @@ try:
     from dipy.segment.mask import median_otsu
 except (ImportError, AttributeError):
     print("WARNING: DIPY not found. Some utility functions may not work.")
-    # Dummy class per evitare crash se dipy manca
+    # Dummy class to prevent crashes if dipy is missing
     GradientTable = type("GradientTable", (object,), {})
 
 def load_dwi_data_dipy(
@@ -57,7 +57,8 @@ def estimate_snr(
     Priority 1 (Temporal): If >= 2 b0s, calculate SNR voxel-wise over time.
                            This is the most robust method for multi-volume data.
     
-    Priority 2 (Spatial):  Fallback only if 1 b0 exists. Uses Signal(Brain)/Noise(Air).
+    Priority 2 (Fallback): If only 1 b0 exists, we cannot reliably estimate temporal SNR.
+                           Returns a default value and advises the user to provide a manual input.
     """
     print("\n[Utils] Estimating SNR...")
     
@@ -73,21 +74,20 @@ def estimate_snr(
     snr_est = 0.0
 
     # --- METHOD 1: TEMPORAL (Primary) ---
-    # Abbassata soglia a 2 volumi come richiesto
     if n_b0 >= 2:
         print(f"  ✓ Method: Temporal (based on {n_b0} b=0 volumes)")
         
-        # Media e Deviazione Standard lungo il tempo (4a dimensione)
+        # Mean and Standard Deviation across time (4th dimension)
         mean_b0 = np.mean(b0_data, axis=-1)
         std_b0 = np.std(b0_data, axis=-1)
         
-        # Evita divisione per zero
+        # Avoid division by zero
         std_b0[std_b0 == 0] = 1e-10
         
-        # Mappa SNR Voxel-wise
+        # Voxel-wise SNR map
         snr_map = mean_b0 / std_b0
         
-        # Estrai la mediana dell'SNR SOLO dentro la maschera del cervello
+        # Extract median SNR ONLY within the brain mask
         if np.sum(mask) > 0:
             snr_est = np.median(snr_map[mask])
             print(f"  ✓ Median Temporal SNR (Brain): {snr_est:.2f}")
@@ -95,44 +95,15 @@ def estimate_snr(
             print("  ! Mask is empty. Defaulting to 30.0")
             snr_est = 30.0
 
-    # --- METHOD 2: SPATIAL (Fallback for single b0) ---
+    # --- FALLBACK (Single b0) ---
     else:
-        print(f"  ✓ Method: Spatial (Fallback for single b=0)")
-        # Se n_b0 = 1, b0_data ha shape (X,Y,Z,1), prendiamo la slice
-        mean_b0 = b0_data[..., 0]
-        
-        # A. SEGNALE: Mediana dentro la Brain Mask (Input)
-        if np.sum(mask) == 0:
-            return 30.0
-        signal_val = np.median(mean_b0[mask])
-        
-        # B. RUMORE: Background Automatico (Otsu)
-        # Usa Otsu per trovare tutto ciò che non è "Segnale MRI" (Testa/Scalpo)
-        # Questo è più sicuro di usare ~mask perché esclude lo scalpo automaticamente
-        otsu_thresh, _ = median_otsu(mean_b0, median_radius=2, numpass=1)
-        
-        # Definisci rumore tutto ciò che è molto sotto la soglia di segnale (es. 50%)
-        noise_thresh = otsu_thresh * 0.5
-        background_mask = mean_b0 < noise_thresh
-        
-        # Calcola deviazione standard nel background
-        noise_vals = mean_b0[background_mask]
-        
-        if len(noise_vals) > 100:
-            noise_std = np.std(noise_vals)
-            # Correzione Rician per il background
-            noise_corr = noise_std / 0.655
-            
-            if noise_corr > 0:
-                snr_est = signal_val / noise_corr
-                print(f"  ✓ Spatial SNR: {snr_est:.2f} (Sig: {signal_val:.1f}, Noise: {noise_corr:.2f})")
-            else:
-                snr_est = 30.0
-        else:
-            print("  ! Insufficient background voxels. Defaulting to 30.0")
-            snr_est = 30.0
+        print("  ! SNR estimation not possible: only one b=0 volume detected.")
+        print("  ! Temporal estimation requires at least 2 b=0 volumes.")
+        print("  ! Please use a manually chosen value (e.g., via CLI input) if available.")
+        print("  ! Defaulting to SNR = 20.0")
+        snr_est = 20.0
 
-    # Safety Clamping (per evitare valori assurdi che rompono la calibrazione)
+    # Safety Clamping (to avoid extreme values breaking calibration)
     if snr_est < 5.0:
         print(f"  ! Low SNR detected ({snr_est:.1f}). Clamping to 5.0")
         snr_est = 5.0
@@ -148,7 +119,7 @@ def save_parameter_maps(param_maps, affine, output_dir, prefix='dbsi'):
     
     for k, v in param_maps.items():
         try:
-            # Salva come float32 per compatibilità
+            # Save as float32 for compatibility
             nib.save(nib.Nifti1Image(v.astype(np.float32), affine), 
                      os.path.join(output_dir, f'{prefix}_{k}.nii.gz'))
         except Exception as e:
