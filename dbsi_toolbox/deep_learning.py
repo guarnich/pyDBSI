@@ -30,7 +30,7 @@ class DBSISyntheticGenerator:
         for _ in range(n_per): fracs.append([0, np.random.uniform(0.4, 0.9), 0, 0]) # Restricted
         for _ in range(n_per): fracs.append([0, 0, 0, np.random.uniform(0.8, 1.0)]) # Water
         
-        # Fill remaining samples if batch_size not divisible by 4
+        # Fill remaining samples
         rem_samples = batch_size - (n_per * n_scenarios)
         for _ in range(rem_samples): fracs.append([0.25, 0.25, 0.25, 0.25])
 
@@ -51,8 +51,7 @@ class DBSISyntheticGenerator:
         N = len(f_fib)
         d_res = np.random.uniform(0.0, self.d_res_threshold, N)
         d_hin = np.random.uniform(self.d_res_threshold + 0.1e-3, 2.5e-3, N)
-        # FIX: d_wat scalar is safer for broadcasting
-        d_wat = 3.0e-3 
+        d_wat = 3.0e-3 # Scalar fixed
         d_ax = np.random.uniform(1.0e-3, 2.5e-3, N)
         d_rad = np.random.uniform(0.1e-3, 0.6e-3, N)
         
@@ -62,15 +61,12 @@ class DBSISyntheticGenerator:
         fiber_dir = np.stack([np.sin(theta)*np.cos(phi), np.sin(theta)*np.sin(phi), np.cos(theta)], axis=1)
 
         # Forward Model
-        # bvecs shape (M, 3), fiber_dir shape (N, 3) -> dot -> (N, M)
         cos_angles = np.dot(fiber_dir, self.bvecs.T)
         d_app_fib = d_rad[:,None] + (d_ax[:,None] - d_rad[:,None]) * cos_angles**2
         
-        # Calcolo Segnale (Corretto broadcasting)
-        # bvals shape (M,) -> Broadcasting (N, 1) * (1, M) -> (N, M)
         S = (f_res[:,None] * np.exp(-self.bvals * d_res[:,None]) +
              f_hin[:,None] * np.exp(-self.bvals * d_hin[:,None]) +
-             f_wat[:,None] * np.exp(-self.bvals * d_wat) + # d_wat è scalare, ok
+             f_wat[:,None] * np.exp(-self.bvals * d_wat) +
              f_fib[:,None] * np.exp(-self.bvals * d_app_fib))
 
         # Rumore Rician
@@ -82,7 +78,6 @@ class DBSISyntheticGenerator:
 
         # Normalize S0
         b0_idx = self.bvals < 50
-        # Usa media b0 se esistono, altrimenti usa la prima misura come S0 approx
         if np.sum(b0_idx) > 0:
             b0_mean = np.mean(S[:, b0_idx], axis=1, keepdims=True)
         else:
@@ -113,12 +108,14 @@ class DBSI_DeepRegularizer:
         self.epochs = epochs
         self.batch_size = batch_size
         self.lr = lr
-        self.gen = DBSISyntheticGenerator(bvals, bvecs, d_res_threshold)
+        # FIX: Rinomina gen -> generator per coerenza con hybrid_calibration.py
+        self.generator = DBSISyntheticGenerator(bvals, bvecs, d_res_threshold)
         self.model = None
 
     def train_on_synthetic(self, n_samples=50000, target_snr=30.0):
         print(f"[DL] Generating {n_samples} samples (SNR={target_snr:.1f})...")
-        X, Y = self.gen.generate_batch(n_samples, snr=target_snr)
+        # FIX: Usa self.generator
+        X, Y = self.generator.generate_batch(n_samples, snr=target_snr)
         ds = TensorDataset(X, Y)
         dl = DataLoader(ds, batch_size=self.batch_size, shuffle=True)
         
@@ -128,14 +125,12 @@ class DBSI_DeepRegularizer:
         
         self.model.train()
         for _ in tqdm(range(self.epochs), desc="Training DL", file=sys.stdout):
-            epoch_loss = 0
             for bx, by in dl:
                 bx, by = bx.to(DEVICE), by.to(DEVICE)
                 opt.zero_grad()
                 loss = crit(self.model(bx), by)
                 loss.backward()
                 opt.step()
-                epoch_loss += loss.item()
 
     def predict_volume(self, vol, mask):
         self.model.eval()
@@ -148,7 +143,7 @@ class DBSI_DeepRegularizer:
             s0 = np.mean(valid[:, b0_idx], axis=1, keepdims=True)
             valid = valid / (s0 + 1e-6)
         else:
-             valid = valid / (valid[:, 0:1] + 1e-6) # Fallback
+             valid = valid / (valid[:, 0:1] + 1e-6)
         
         ds = TensorDataset(torch.tensor(valid, dtype=torch.float32))
         dl = DataLoader(ds, batch_size=4096)
@@ -159,6 +154,7 @@ class DBSI_DeepRegularizer:
         
         flat = np.concatenate(preds, 0)
         maps = {}
+        # Keys coerenti con lo script di analisi
         for i, k in enumerate(['dl_restricted_fraction', 'dl_hindered_fraction', 'dl_water_fraction', 'dl_fiber_fraction']):
             m = np.zeros((X,Y,Z))
             m[mask] = flat[:, i]

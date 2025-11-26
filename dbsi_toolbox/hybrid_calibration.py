@@ -14,7 +14,7 @@ def optimize_hybrid_alpha(
     bvecs, 
     snr_estimate, 
     alphas=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0], # Range logaritmico
-    n_monte_carlo=500, # 500 voxel sono statisticamente sufficienti e veloci
+    n_monte_carlo=1000, # 500 voxel sono statisticamente sufficienti e veloci
     d_res_threshold=0.3e-3
 ):
     """
