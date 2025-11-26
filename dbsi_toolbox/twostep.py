@@ -8,9 +8,9 @@ from .common import DBSIParams
 
 class DBSI_TwoStep(BaseDBSI):
     """
-    Implementazione Standard del DBSI (Two-Step).
-    1. Linear Basis Spectrum (NNLS) -> Stima frazioni e direzioni
-    2. Non-Linear Tensor Fit (NLLS) -> Raffina diffusività
+    Standard DBSI Implementation (Two-Step Approach).
+    1. Linear Basis Spectrum (NNLS) -> Estimates fractions and directions.
+    2. Non-Linear Tensor Fit (NLLS) -> Refines diffusivities (AD/RD).
     """
     
     def __init__(self, 
@@ -21,7 +21,7 @@ class DBSI_TwoStep(BaseDBSI):
                  axial_diff_basis=1.5e-3,
                  radial_diff_basis=0.3e-3):
         
-        # Inizializza i due modelli interni
+        # Initialize the two internal models
         self.spectrum_model = DBSI_BasisSpectrum(
             iso_diffusivity_range=iso_diffusivity_range,
             n_iso_bases=n_iso_bases,
@@ -35,11 +35,11 @@ class DBSI_TwoStep(BaseDBSI):
         
     def fit_volume(self, volume, bvals, bvecs, **kwargs):
         """
-        Setup iniziale prima di lanciare il loop della classe base.
+        Initial setup before launching the voxel-wise loop defined in BaseDBSI.
         """
         print("[DBSI] Initializing Standard Two-Step Fit...")
         
-        # Standardizzazione input
+        # Standardize Inputs
         flat_bvals = np.array(bvals).flatten()
         N = len(flat_bvals)
         
@@ -48,32 +48,32 @@ class DBSI_TwoStep(BaseDBSI):
         else:
             current_bvecs = bvecs
             
-        # Pre-calcolo della matrice di design (solo una volta per tutto il volume)
+        # Pre-calculate the Design Matrix (only once for the entire volume)
         print(f"[DBSI] Pre-calculating Design Matrix ({self.spectrum_model.n_iso_bases} isotropic bases)...")
         self.spectrum_model.design_matrix = self.spectrum_model._build_design_matrix(flat_bvals, current_bvecs)
         
-        # Condividi i vettori gradienti con i sottomodelli
+        # Share gradient vectors with sub-models
         self.spectrum_model.current_bvecs = current_bvecs
         self.fitting_model.current_bvecs = current_bvecs
         
-        # Lancia il fit voxel-by-voxel gestito da BaseDBSI
+        # Launch the voxel-by-voxel fit managed by BaseDBSI
         return super().fit_volume(volume, bvals, bvecs, **kwargs)
 
     def fit_voxel(self, signal: np.ndarray, bvals: np.ndarray) -> DBSIParams:
         # --- STEP 1: Basis Spectrum (NNLS) ---
-        # Trova rapidamente le frazioni e le direzioni principali
+        # Quickly find fractions and principal directions using the linear solver
         spectrum_result = self.spectrum_model.fit_voxel(signal, bvals)
         
-        # Se il fit lineare non trova nulla o fallisce, restituisci quello che hai
+        # If the linear fit finds nothing or fails (e.g., empty voxel), return what we have
         if spectrum_result.f_fiber == 0 and spectrum_result.f_iso_total == 0:
             return spectrum_result
             
         # --- STEP 2: Tensor Fit (NLLS) ---
-        # Usa il risultato dello spettro come "initial guess" per raffinare i parametri
-        # Nota: Se vuoi velocizzare, puoi commentare questo step e restituire spectrum_result
+        # Use the spectrum result as an "initial guess" to refine parameters (specifically AD and RD)
+        # Note: To speed up processing, this step could be skipped if standard AD/RD values are sufficient.
         try:
             final_result = self.fitting_model.fit_voxel(signal, bvals, initial_guess=spectrum_result)
             return final_result
         except Exception:
-            # Fallback al risultato lineare se il non-lineare fallisce
+            # Fallback to linear result if non-linear optimization fails
             return spectrum_result

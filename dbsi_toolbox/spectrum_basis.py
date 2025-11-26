@@ -8,7 +8,7 @@ from .common import DBSIParams
 class DBSI_BasisSpectrum(BaseDBSI):  
     """
     DBSI Basis Spectrum solver using standard Scipy NNLS.
-    Rimosso ogni riferimento a Numba per garantire stabilità.
+    References to Numba have been removed to ensure maximum stability and compatibility.
     """
     def __init__(self, 
                  iso_diffusivity_range=(0.0, 3.0e-3),
@@ -25,19 +25,21 @@ class DBSI_BasisSpectrum(BaseDBSI):
         self.reg_lambda = reg_lambda
         self.filter_threshold = filter_threshold
         
-        # Stato interno
+        # Internal state
         self.design_matrix = None
         self.current_bvecs = None
         self.iso_diffusivities = None
 
     def _build_design_matrix(self, bvals: np.ndarray, bvecs: np.ndarray) -> np.ndarray:
         """
-        Costruisce la matrice di design usando NumPy standard.
+        Constructs the DBSI design matrix (A) using standard NumPy.
+        Rows: Measurements (b-values).
+        Cols: Basis Functions (Anisotropic fibers + Isotropic spectrum).
         """
         n_meas = len(bvals)
         n_aniso = len(bvecs) 
         
-        # Griglia diffusività isotrope
+        # Create grid of isotropic diffusivities
         self.iso_diffusivities = np.linspace(
             self.iso_range[0], self.iso_range[1], self.n_iso_bases
         )
@@ -45,16 +47,18 @@ class DBSI_BasisSpectrum(BaseDBSI):
         
         A = np.zeros((n_meas, n_aniso + n_iso))
         
-        # 1. Base Anisotropa (Fibre)
+        # 1. Anisotropic Basis (Fibers)
+        # We assume fixed axial/radial diffusivities for the basis set
         for j in range(n_aniso):
             fiber_dir = bvecs[j]
-            # Calcolo coseno angolo tra gradiente e fibra
+            # Calculate cosine of angle between gradient and fiber direction
             cos_angles = np.dot(bvecs, fiber_dir)
-            # Diffusività apparente: D_rad + (D_ax - D_rad) * cos^2(theta)
+            
+            # Apparent diffusivity: D_rad + (D_ax - D_rad) * cos^2(theta)
             D_app = self.radial_diff_basis + (self.axial_diff_basis - self.radial_diff_basis) * (cos_angles**2)
             A[:, j] = np.exp(-bvals * D_app)
             
-        # 2. Base Isotropa
+        # 2. Isotropic Basis (Spectrum)
         for i, D_iso in enumerate(self.iso_diffusivities):
             A[:, n_aniso + i] = np.exp(-bvals * D_iso)
             
@@ -62,14 +66,15 @@ class DBSI_BasisSpectrum(BaseDBSI):
 
     def fit_voxel(self, signal: np.ndarray, bvals: np.ndarray) -> DBSIParams:
         """
-        Fit singolo voxel usando Scipy.
+        Fits a single voxel using Scipy NNLS with Tikhonov regularization.
         """
         if self.design_matrix is None:
             return self._get_empty_params()
 
-        # 1. Normalizzazione e controlli
+        # 1. Normalization and Safety Checks
         if not np.all(np.isfinite(signal)): return self._get_empty_params()
         
+        # Normalize by b0 (assuming b < 50 is effectively b0)
         if np.any(bvals < 50):
             S0 = np.mean(signal[bvals < 50])
         else:
@@ -79,9 +84,9 @@ class DBSI_BasisSpectrum(BaseDBSI):
         
         y = signal / S0
         
-        # 2. Preparazione matrici per NNLS con regolarizzazione Tikhonov
-        # Sistema: ||Ax - y||^2 + lambda*||x||^2
-        # Si risolve augumentando A con sqrt(lambda)*I e y con zeri
+        # 2. Prepare matrices for NNLS with Tikhonov Regularization
+        # Objective: minimize ||Ax - y||^2 + lambda * ||x||^2
+        # This is solved by augmenting A with sqrt(lambda)*I and y with zeros.
         
         if self.reg_lambda > 0:
             n_cols = self.design_matrix.shape[1]
@@ -92,35 +97,36 @@ class DBSI_BasisSpectrum(BaseDBSI):
             A_aug = self.design_matrix
             y_aug = y
 
-        # 3. Solver Scipy
+        # 3. Scipy NNLS Solver
         try:
             weights, _ = nnls(A_aug, y_aug)
         except Exception:
             return self._get_empty_params()
         
-        # 4. Filtering (Sparsity)
+        # 4. Filtering (Sparsity Enforcement)
+        # Remove very small weights that are likely noise artifacts
         weights[weights < self.filter_threshold] = 0.0
         
-        # 5. Estrazione Metriche
+        # 5. Extract Metrics
         n_aniso = len(self.current_bvecs)
         
-        # Anisotropo
+        # --- Anisotropic Component ---
         aniso_weights = weights[:n_aniso]
         f_fiber = np.sum(aniso_weights)
         
-        # Direzione principale (corrisponde al peso maggiore nella base anisotropa)
+        # Determine dominant direction (corresponds to the highest weight in the anisotropic basis)
         if f_fiber > 0:
             dom_idx = np.argmax(aniso_weights)
             main_dir = self.current_bvecs[dom_idx]
         else:
             main_dir = np.array([0.0, 0.0, 0.0])
         
-        # Isotropo
+        # --- Isotropic Component ---
         iso_weights = weights[n_aniso:]
         
-        # Categorie (Wang et al., 2011)
-        # Restricted: <= 0.3 um^2/ms
-        # Hindered: 0.3 < D <= 2.0 um^2/ms (spesso acqua extracellulare / edema)
+        # Categorization based on Wang et al., 2011 / Cross & Song, 2017:
+        # Restricted: <= 0.3 um^2/ms (Cellular)
+        # Hindered: 0.3 < D <= 2.0 um^2/ms (Extracellular / Edema)
         # Free Water: > 2.0 um^2/ms (CSF)
         
         mask_res = self.iso_diffusivities <= 0.3e-3
@@ -131,7 +137,7 @@ class DBSI_BasisSpectrum(BaseDBSI):
         f_hindered = np.sum(iso_weights[mask_hin])
         f_water = np.sum(iso_weights[mask_wat])
         
-        # Normalizzazione (frazioni relative)
+        # 6. Final Normalization (Relative Fractions)
         total = f_fiber + f_restricted + f_hindered + f_water
         if total > 0:
             f_fiber /= total
@@ -139,7 +145,7 @@ class DBSI_BasisSpectrum(BaseDBSI):
             f_hindered /= total
             f_water /= total
         
-        # R-Squared (sul segnale originale, non aumentato)
+        # 7. Calculate R-Squared (on original data, not augmented)
         predicted = self.design_matrix @ weights
         ss_res = np.sum((y - predicted)**2)
         ss_tot = np.sum((y - np.mean(y))**2)
@@ -151,7 +157,7 @@ class DBSI_BasisSpectrum(BaseDBSI):
             f_water=float(f_water),
             f_fiber=float(f_fiber),
             fiber_dir=main_dir,
-            axial_diffusivity=self.axial_diff_basis,
-            radial_diffusivity=self.radial_diff_basis,
+            axial_diffusivity=self.axial_diff_basis,   # Fixed basis value in Step 1
+            radial_diffusivity=self.radial_diff_basis, # Fixed basis value in Step 1
             r_squared=float(r2)
         )
