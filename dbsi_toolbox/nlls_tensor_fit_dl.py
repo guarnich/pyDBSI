@@ -46,7 +46,7 @@ class DBSI_TensorFit_DL(DBSI_TensorFit):
             0.0, 0.0                 # Angoli (raffinati poi dai gradienti)
         ]
         
-        # --- Bounds Dinamici ---
+        # --- Bounds Dinamici (in base alla soglia) ---
         # Limite superiore Restricted = d_res_threshold
         # Limite inferiore Hindered = d_res_threshold
         
