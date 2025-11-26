@@ -12,77 +12,106 @@ from typing import Dict, Tuple
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ==========================================
-# 1. GENERATORE SINTETICO (Protocol-Specific)
+# 1. GENERATORE SINTETICO "SCENARIO-BASED"
 # ==========================================
 class DBSISyntheticGenerator:
     """
-    Genera segnali DBSI sintetici basati ESATTAMENTE sui bvals/bvecs 
-    dell'immagine in input. Questo garantisce la validità fisica.
+    Genera dati sintetici bilanciati per coprire i casi clinici reali.
+    Invece di frazioni casuali uniformi, simula voxel specifici:
+    1. Sostanza Bianca Sana (Alta Fibra)
+    2. Edema/Danno Tissutale (Alto Hindered)
+    3. Infiammazione/Tumore (Alto Restricted)
+    4. CSF/Cisti (Alta Acqua Libera)
     """
-    def __init__(self, bvals: np.ndarray, bvecs: np.ndarray, n_iso_bases: int = 20):
+    def __init__(self, bvals: np.ndarray, bvecs: np.ndarray):
         self.bvals = bvals
         self.bvecs = bvecs
         self.n_meas = len(bvals)
-        self.n_iso = n_iso_bases
 
     def generate_batch(self, batch_size: int, snr: float = 30.0) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Logica "Scenario-Based" per coprire tutti i casi clinici (Sano, Edema, Infiammazione)
-        n1 = batch_size // 3
-        n2 = batch_size // 3
-        n3 = batch_size - n1 - n2
+        # Dividiamo il batch in 4 scenari
+        n_scenarios = 4
+        n_per_scen = batch_size // n_scenarios
         
-        # 1. Fibra Dominante
-        f_fib_1 = np.random.uniform(0.4, 0.9, n1)
-        iso_1 = np.random.dirichlet((1, 1, 1), n1)
-        
-        # 2. Hindered Dominante (Edema)
-        f_fib_2 = np.random.uniform(0.0, 0.3, n2)
-        iso_2 = np.random.dirichlet((1, 8, 1), n2) 
-        
-        # 3. Restricted Dominante (Infiammazione)
-        f_fib_3 = np.random.uniform(0.1, 0.5, n3)
-        iso_3 = np.random.dirichlet((8, 1, 1), n3)
+        # --- SCENARIO 1: Fiber Dominant (White Matter) ---
+        # Fiber > 60%, il resto rumore isotropo
+        f_fib_1 = np.random.uniform(0.60, 0.95, n_per_scen)
+        rem_1 = 1.0 - f_fib_1
+        # Distribuisci il rimanente casualmente
+        iso_mix_1 = np.random.dirichlet((1, 1, 1), n_per_scen) 
+        f_res_1 = rem_1 * iso_mix_1[:, 0]
+        f_hin_1 = rem_1 * iso_mix_1[:, 1]
+        f_wat_1 = rem_1 * iso_mix_1[:, 2]
 
-        f_fiber = np.concatenate([f_fib_1, f_fib_2, f_fib_3])
-        iso_ratios = np.concatenate([iso_1, iso_2, iso_3])
+        # --- SCENARIO 2: Hindered Dominant (Edema/Grey Matter) ---
+        # Hindered > 50%, Fiber bassa
+        f_hin_2 = np.random.uniform(0.50, 0.90, n_per_scen)
+        rem_2 = 1.0 - f_hin_2
+        iso_mix_2 = np.random.dirichlet((1, 2, 1), n_per_scen) # [res, fib, wat]
+        f_res_2 = rem_2 * iso_mix_2[:, 0]
+        f_fib_2 = rem_2 * iso_mix_2[:, 1]
+        f_wat_2 = rem_2 * iso_mix_2[:, 2]
+
+        # --- SCENARIO 3: Restricted Dominant (High Cellularity) ---
+        # Restricted > 40% (Raro ma critico da imparare)
+        f_res_3 = np.random.uniform(0.40, 0.80, n_per_scen)
+        rem_3 = 1.0 - f_res_3
+        iso_mix_3 = np.random.dirichlet((1, 1, 1), n_per_scen)
+        f_hin_3 = rem_3 * iso_mix_3[:, 0]
+        f_fib_3 = rem_3 * iso_mix_3[:, 1]
+        f_wat_3 = rem_3 * iso_mix_3[:, 2]
+
+        # --- SCENARIO 4: Water Dominant (CSF/Necrosis) ---
+        # Water > 80%
+        f_wat_4 = np.random.uniform(0.80, 1.00, n_per_scen)
+        rem_4 = 1.0 - f_wat_4
+        iso_mix_4 = np.random.dirichlet((1, 1, 1), n_per_scen)
+        f_res_4 = rem_4 * iso_mix_4[:, 0]
+        f_hin_4 = rem_4 * iso_mix_4[:, 1]
+        f_fib_4 = rem_4 * iso_mix_4[:, 2]
+
+        # Concatenazione
+        f_fiber = np.concatenate([f_fib_1, f_fib_2, f_fib_3, f_fib_4])
+        f_res = np.concatenate([f_res_1, f_res_2, f_res_3, f_res_4])
+        f_hin = np.concatenate([f_hin_1, f_hin_2, f_hin_3, f_hin_4])
+        f_wat = np.concatenate([f_wat_1, f_wat_2, f_wat_3, f_wat_4])
+
+        # Shuffle per non polarizzare il batch
+        perm = np.random.permutation(len(f_fiber))
+        f_fiber, f_res, f_hin, f_wat = f_fiber[perm], f_res[perm], f_hin[perm], f_wat[perm]
+
+        # --- Parametri Fisici (Strict Bounds) ---
+        batch_real_size = len(f_fiber)
         
-        # Shuffle
-        perm = np.random.permutation(batch_size)
-        f_fiber = f_fiber[perm]
-        iso_ratios = iso_ratios[perm]
+        # Restricted: [0, 0.2] um2/ms (Strictly < 0.3)
+        d_res = np.random.uniform(0.0, 0.2e-3, batch_real_size)
+        
+        # Hindered: [0.8, 2.0] um2/ms (Separation gap from Restricted)
+        d_hin = np.random.uniform(0.8e-3, 2.0e-3, batch_real_size)
+        
+        # Water: 3.0 fix
+        d_wat = 3.0e-3
+        
+        # Fiber: [1.0, 2.5] axial, [0.1, 0.6] radial
+        d_ax = np.random.uniform(1.0e-3, 2.5e-3, batch_real_size)
+        d_rad = np.random.uniform(0.1e-3, 0.6e-3, batch_real_size)
 
-        # Calcolo Frazioni Reali
-        f_iso_total = 1.0 - f_fiber
-        f_res = f_iso_total * iso_ratios[:, 0]
-        f_hin = f_iso_total * iso_ratios[:, 1]
-        f_wat = f_iso_total * iso_ratios[:, 2]
-
-        # Parametri Fisici
-        theta = np.arccos(2 * np.random.rand(batch_size) - 1)
-        phi = 2 * np.pi * np.random.rand(batch_size)
+        # Fiber Orientation
+        theta = np.arccos(2 * np.random.rand(batch_real_size) - 1)
+        phi = 2 * np.pi * np.random.rand(batch_real_size)
         fiber_dir = np.stack([
             np.sin(theta) * np.cos(phi),
             np.sin(theta) * np.sin(phi),
             np.cos(theta)
         ], axis=1)
 
-        d_ax = np.random.uniform(1.5e-3, 2.2e-3, batch_size)
-        d_rad = np.random.uniform(0.1e-3, 0.6e-3, batch_size)
-        d_res = 0.1e-3 # Restricted fisso basso
-        d_hin = 1.5e-3 # Hindered medio
-        d_wat = 3.0e-3 # Acqua libera
-
-        # Forward Model: Usiamo i bvecs/bvals REALI
-        signals = np.zeros((batch_size, self.n_meas))
+        # --- Forward Model ---
         cos_angles = np.dot(fiber_dir, self.bvecs.T)
-        
-        # Anisotropo
         d_app_fiber = d_rad[:, None] + (d_ax[:, None] - d_rad[:, None]) * (cos_angles**2)
-        sig_fib = np.exp(-self.bvals[None, :] * d_app_fiber)
         
-        # Isotropo
-        sig_res = np.exp(-self.bvals[None, :] * d_res)
-        sig_hin = np.exp(-self.bvals[None, :] * d_hin)
+        sig_fib = np.exp(-self.bvals[None, :] * d_app_fiber)
+        sig_res = np.exp(-self.bvals[None, :] * d_res[:, None])
+        sig_hin = np.exp(-self.bvals[None, :] * d_hin[:, None])
         sig_wat = np.exp(-self.bvals[None, :] * d_wat)
         
         clean_signal = (
@@ -98,48 +127,52 @@ class DBSISyntheticGenerator:
         noise_imag = np.random.normal(0, sigma, clean_signal.shape)
         noisy_signal = np.sqrt((clean_signal + noise_real)**2 + noise_imag**2)
         
-        # Normalizzazione (Cruciale per DL)
+        # Normalizzazione S0
         b0_mean = np.mean(noisy_signal[:, self.bvals < 50], axis=1, keepdims=True) + 1e-9
         noisy_signal = noisy_signal / b0_mean
 
-        # Target: [Restricted, Hindered, Water, Fiber]
-        labels = np.stack([f_res, f_hin, f_wat, f_fiber], axis=1)
+        # Tensori per PyTorch
+        X = torch.tensor(noisy_signal, dtype=torch.float32)
+        # Labels Order: [Restricted, Hindered, Water, Fiber]
+        Y = torch.tensor(np.stack([f_res, f_hin, f_wat, f_fiber], axis=1), dtype=torch.float32)
 
-        return torch.tensor(noisy_signal, dtype=torch.float32), torch.tensor(labels, dtype=torch.float32)
+        return X, Y
 
 # ==========================================
-# 2. RETE NEURALE SEMPLIFICATA (Solo Priors)
+# 2. RETE NEURALE
 # ==========================================
 class DBSI_PriorNet(nn.Module):
     def __init__(self, n_input_meas: int):
         super().__init__()
+        # Rete leggermente più profonda per catturare le non-linearità difficili
         self.net = nn.Sequential(
-            nn.Linear(n_input_meas, 256),
+            nn.Linear(n_input_meas, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(), # GELU performa meglio di ReLU per regressione fisica
+            nn.Dropout(0.1),
+            
+            nn.Linear(512, 256),
             nn.BatchNorm1d(256),
-            nn.ELU(),
+            nn.GELU(),
             nn.Dropout(0.1),
             
             nn.Linear(256, 128),
             nn.BatchNorm1d(128),
-            nn.ELU(),
+            nn.GELU(),
             
-            nn.Linear(128, 4), # Output: [f_res, f_hin, f_wat, f_fib]
-            nn.Softmax(dim=1)  # Somma a 1
+            nn.Linear(128, 4), 
+            nn.Softmax(dim=1)
         )
 
     def forward(self, x):
         return self.net(x)
 
 # ==========================================
-# 3. REGOLARIZZATORE (Gestore)
+# 3. REGOLARIZZATORE
 # ==========================================
 class DBSI_DeepRegularizer:
-    """
-    Addestra una rete neurale su dati sintetici generati ad-hoc per il protocollo corrente.
-    Fornisce i 'priors' per il fit NLLS.
-    """
-    def __init__(self, bvals: np.ndarray, bvecs: np.ndarray, epochs: int = 100, 
-                 batch_size: int = 2048, lr: float = 1e-3):
+    def __init__(self, bvals: np.ndarray, bvecs: np.ndarray, epochs: int = 50, 
+                 batch_size: int = 1024, lr: float = 1e-3):
         self.bvals = bvals
         self.bvecs = bvecs
         self.epochs = epochs
@@ -148,24 +181,25 @@ class DBSI_DeepRegularizer:
         self.model = None
         self.generator = DBSISyntheticGenerator(bvals, bvecs)
 
-    # MODIFICA QUI: Aggiunto parametro target_snr
-    def train_on_synthetic(self, n_samples=500000, target_snr=30.0):
-        print(f"[DL-Reg] Generating {n_samples} synthetic samples (Protocol-Specific, SNR={target_snr:.1f})...")
+    def train_on_synthetic(self, n_samples=100000, target_snr=30.0):
+        # Aumentiamo i sample a 100k per coprire bene tutti gli scenari
+        print(f"[DL-Reg] Generating {n_samples} Scenario-Based samples (SNR={target_snr:.1f})...")
         
-        # Passiamo l'SNR stimato al generatore
         X, Y = self.generator.generate_batch(n_samples, snr=target_snr)
         
         dataset = TensorDataset(X, Y)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         
         self.model = DBSI_PriorNet(n_input_meas=len(self.bvals)).to(DEVICE)
-        optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        criterion = nn.MSELoss() 
+        optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
+        criterion = nn.HuberLoss() # Più robusto agli outlier del MSE
         
         self.model.train()
         print(f"[DL-Reg] Training Prior Network on {DEVICE}...")
         
-        for _ in tqdm(range(self.epochs), desc="Training Priors", file=sys.stdout):
+        pbar = tqdm(range(self.epochs), desc="Training Priors", file=sys.stdout)
+        for _ in pbar:
+            epoch_loss = 0
             for bx, by in loader:
                 bx, by = bx.to(DEVICE), by.to(DEVICE)
                 optimizer.zero_grad()
@@ -173,23 +207,23 @@ class DBSI_DeepRegularizer:
                 loss = criterion(preds, by)
                 loss.backward()
                 optimizer.step()
+                epoch_loss += loss.item()
+            pbar.set_postfix({'loss': epoch_loss / len(loader)})
 
     def predict_volume(self, volume: np.ndarray, mask: np.ndarray) -> Dict[str, np.ndarray]:
         if self.model is None: raise RuntimeError("Model not trained.")
         
         self.model.eval()
         X_dim, Y_dim, Z_dim, N_meas = volume.shape
-        
-        # Estrai voxel validi
         valid_signals = volume[mask]
         
-        # Normalizzazione S0
+        # Normalizzazione
         b0_idx = self.bvals < 50
         if np.sum(b0_idx) > 0:
             s0 = np.mean(valid_signals[:, b0_idx], axis=1, keepdims=True)
             valid_signals = valid_signals / (s0 + 1e-9)
             
-        # Inferenza
+        # Batch Inference
         dataset = TensorDataset(torch.tensor(valid_signals, dtype=torch.float32))
         loader = DataLoader(dataset, batch_size=4096, shuffle=False)
         
@@ -201,8 +235,8 @@ class DBSI_DeepRegularizer:
                 
         flat_preds = np.concatenate(preds_list, axis=0)
         
-        # Ricostruzione Mappe 3D
         maps = {}
+        # Order: [Restricted, Hindered, Water, Fiber]
         keys = ['dl_restricted_fraction', 'dl_hindered_fraction', 'dl_water_fraction', 'dl_fiber_fraction']
         
         for i, k in enumerate(keys):
