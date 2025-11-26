@@ -138,8 +138,8 @@ class DBSI_DeepRegularizer:
     Addestra una rete neurale su dati sintetici generati ad-hoc per il protocollo corrente.
     Fornisce i 'priors' per il fit NLLS.
     """
-    def __init__(self, bvals: np.ndarray, bvecs: np.ndarray, epochs: int = 50, 
-                 batch_size: int = 1024, lr: float = 1e-3):
+    def __init__(self, bvals: np.ndarray, bvecs: np.ndarray, epochs: int = 100, 
+                 batch_size: int = 2048, lr: float = 1e-3):
         self.bvals = bvals
         self.bvecs = bvecs
         self.epochs = epochs
@@ -148,21 +148,23 @@ class DBSI_DeepRegularizer:
         self.model = None
         self.generator = DBSISyntheticGenerator(bvals, bvecs)
 
-    def train_on_synthetic(self, n_samples=50000):
-        print(f"[DL-Reg] Generating {n_samples} synthetic samples (Protocol-Specific)...")
-        X, Y = self.generator.generate_batch(n_samples, snr=30.0)
+    # MODIFICA QUI: Aggiunto parametro target_snr
+    def train_on_synthetic(self, n_samples=500000, target_snr=30.0):
+        print(f"[DL-Reg] Generating {n_samples} synthetic samples (Protocol-Specific, SNR={target_snr:.1f})...")
+        
+        # Passiamo l'SNR stimato al generatore
+        X, Y = self.generator.generate_batch(n_samples, snr=target_snr)
         
         dataset = TensorDataset(X, Y)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         
         self.model = DBSI_PriorNet(n_input_meas=len(self.bvals)).to(DEVICE)
         optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        criterion = nn.MSELoss() # MSE sulle frazioni
+        criterion = nn.MSELoss() 
         
         self.model.train()
         print(f"[DL-Reg] Training Prior Network on {DEVICE}...")
         
-        # Training loop rapido
         for _ in tqdm(range(self.epochs), desc="Training Priors", file=sys.stdout):
             for bx, by in loader:
                 bx, by = bx.to(DEVICE), by.to(DEVICE)
