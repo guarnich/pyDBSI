@@ -6,7 +6,7 @@ from .base import BaseDBSI
 from .common import DBSIParams
 from typing import Optional
 
-class DBSI_TensorFit(BaseDBSI):  # <--- CAMBIATO
+class DBSI_TensorFit(BaseDBSI):  
     """
     DBSI Tensor parameter estimation using Non-Linear Least Squares.
     Refines diffusivities and angles starting from an initial guess.
