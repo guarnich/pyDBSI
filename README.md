@@ -1,5 +1,3 @@
-
-````markdown
 # pyDBSI_twostep: Two-Step DBSI Fitting Toolbox
 
 A Python toolbox for fitting the **Diffusion Basis Spectrum Imaging (DBSI)** model using the robust **Two-Step** approach (Linear Spectrum + Non-Linear Tensor refinement).
@@ -74,6 +72,8 @@ python examples/run_dbsi.py \
     --mask  "subject/dwi/brain_mask.nii.gz" \
     --out   "subject/dbsi_results"
 ````
+
+-----
 
 ### Advanced Usage
 
