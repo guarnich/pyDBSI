@@ -4,6 +4,7 @@ import os
 import numpy as np
 import nibabel as nib
 from typing import Tuple, Optional
+from typing import Optional, Dict
 
 # Import DIPY functions
 try:
@@ -20,7 +21,7 @@ def load_dwi_data_dipy(
     f_bval: str, 
     f_bvec: str, 
     f_mask: str 
-) -> Tuple[np.ndarray, np.ndarray, 'GradientTable', np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, 'GradientTable', np.ndarray]: #type: ignore
     """
     Loads DWI data, bvals, bvecs, and the MANDATORY brain mask.
     """
@@ -111,7 +112,7 @@ def estimate_snr_rician_corrected(
 
 def estimate_snr(
     data: np.ndarray, 
-    gtab: 'GradientTable',
+    gtab: 'GradientTable', #type: ignore
     affine: np.ndarray,
     mask: np.ndarray,
     method: str = 'temporal_rician'
