@@ -4,7 +4,7 @@ from .spectrum_basis import DBSI_BasisSpectrum
 from .nlls_tensor_fit import DBSI_TensorFit
 from .twostep import DBSI_TwoStep  
 from .common import DBSIParams
-from .utils import load_dwi_data_dipy, save_parameter_maps, estimate_snr
+from .utils import load_dwi_data_dipy, save_parameter_maps, estimate_snr, estimate_snr_rician_corrected
 
 # Default model is the Two-Step approach
 DBSIModel = DBSI_TwoStep 

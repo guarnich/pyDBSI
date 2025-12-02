@@ -4,7 +4,7 @@ import numpy as np
 from scipy.optimize import least_squares, differential_evolution
 from .base import BaseDBSI
 from .common import DBSIParams
-from typing import Optional
+from typing import Optional, Dict, Tuple
 import warnings
 
 class DBSI_TensorFit(BaseDBSI):  
